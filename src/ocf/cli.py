@@ -47,6 +47,7 @@ from ocf.exporters import claude_code as _cc
 from ocf.exporters import codex as _codex
 from ocf.exporters import cursor as _cursor
 from ocf.exporters._base import AmbiguousMatchError
+from ocf.renderers import RENDERERS, render_all, select_ocf_files
 
 # Tool dispatch table. Aliases (``claude-code``) point at the same
 # module object so argparse accepts either spelling. Sorted display in
@@ -73,6 +74,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_export(args)
         if args.command == "list":
             return _cmd_list(args)
+        if args.command == "render":
+            return _cmd_render(args)
     except FileNotFoundError as exc:
         # Missing source directory is a user/environment problem, not a bug.
         print(f"error: {exc}", file=sys.stderr)
@@ -201,6 +204,85 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Filter to sessions matching this UUID or fuzzy title.",
     )
 
+    # ---- render -------------------------------------------------------
+    render_format_choices = sorted(set(RENDERERS))
+    p_render = sub.add_parser(
+        "render",
+        help="Render OCF documents to a human-readable format (Markdown).",
+        description=(
+            "Convert OCF documents into Markdown (default) or any other "
+            "registered renderer format. Selection happens against OCF "
+            "fields (title, platform, project, id) — sources are not "
+            "touched. The render manifest tracks per-file hashes so "
+            "re-runs only re-render changed inputs."
+        ),
+    )
+    p_render.add_argument(
+        "input",
+        nargs="+",
+        type=Path,
+        help=(
+            "One or more OCF files or directories containing *.ocf.json. "
+            "Directories are recursed."
+        ),
+    )
+    p_render.add_argument(
+        "--out",
+        type=Path,
+        default=Path("./ocf-rendered"),
+        help="Output directory (default: ./ocf-rendered).",
+    )
+    p_render.add_argument(
+        "--format",
+        dest="format",
+        choices=render_format_choices,
+        default="md",
+        help=f"Output format. One of: {', '.join(render_format_choices)}.",
+    )
+    p_render.add_argument(
+        "--query",
+        default=None,
+        help=(
+            "Filter to OCF docs matching this fuzzy title query, UUID, "
+            "or source.original_id."
+        ),
+    )
+    p_render.add_argument(
+        "--platform",
+        default=None,
+        help="Filter to docs whose conversation.source.platform == VALUE.",
+    )
+    p_render.add_argument(
+        "--project",
+        default=None,
+        help="Filter to docs whose conversation.project matches VALUE.",
+    )
+    p_render.add_argument(
+        "--since",
+        default=None,
+        help=(
+            "Filter to docs created on/after this ISO date "
+            "(e.g. 2026-01-01 or 2026-04-26T00:00:00Z)."
+        ),
+    )
+    p_render.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-render every input even if the manifest says skip.",
+    )
+    p_render.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Report what would happen; do not write any files.",
+    )
+    p_render.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Suppress per-file lines; print only the summary.",
+    )
+
     return parser
 
 
@@ -268,6 +350,64 @@ def _cmd_list(args: argparse.Namespace) -> int:
     for s in sources:
         print(s)
     print(f"total: {len(sources)}", file=sys.stderr)
+    return 0
+
+
+def _cmd_render(args: argparse.Namespace) -> int:
+    from datetime import datetime
+
+    renderer_cls = RENDERERS[args.format]
+    renderer = renderer_cls()
+
+    since: datetime | None = None
+    if args.since is not None:
+        try:
+            since = datetime.fromisoformat(args.since.replace("Z", "+00:00"))
+        except ValueError:
+            print(
+                f"error: --since value {args.since!r} is not a valid ISO date",
+                file=sys.stderr,
+            )
+            return 2
+
+    selected = select_ocf_files(
+        args.input,
+        query=args.query,
+        platform=args.platform,
+        project=args.project,
+        since=since,
+    )
+    if not selected:
+        print("no OCF documents matched the selection", file=sys.stderr)
+        return 1
+    if not args.quiet:
+        print(f"selected {len(selected)} OCF document(s) for rendering")
+
+    result = render_all(
+        renderer,
+        args.out,
+        sources=selected,
+        force=args.force,
+        dry_run=args.dry_run,
+    )
+
+    if not args.quiet:
+        for src in result.new:
+            print(f"new      {src}")
+        for src in result.updated:
+            print(f"updated  {src}")
+        for src in result.skipped:
+            print(f"skipped  {src}")
+
+    if args.dry_run:
+        print(f"[dry-run] {result.summary()}")
+    else:
+        print(result.summary())
+
+    if result.failed:
+        for src, msg in result.failed:
+            print(f"FAILED   {src}: {msg}", file=sys.stderr)
+        return 1
     return 0
 
 

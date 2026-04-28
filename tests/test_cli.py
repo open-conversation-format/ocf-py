@@ -382,3 +382,180 @@ def test_list_codex_empty_dir_returns_zero(
     assert rc == 0
     captured = capsys.readouterr()
     assert "total: 0" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# render — CLI plumbing for the renderer layer
+# ---------------------------------------------------------------------------
+
+def _write_ocf(path: Path, **conv_overrides) -> None:
+    """Helper: write a minimal valid OCF doc with optional overrides."""
+    conv = {
+        "id": conv_overrides.pop("id", "conv_render_test"),
+        "title": conv_overrides.pop("title", "Render Test"),
+        "created_at": "2026-04-26T10:00:00Z",
+        "default_model": "claude-sonnet-4-5",
+        "source": {
+            "platform": conv_overrides.pop("platform", "cursor"),
+            "original_id": "x:1",
+        },
+    }
+    if "project_name" in conv_overrides:
+        conv["project"] = {
+            "id": "p1",
+            "name": conv_overrides.pop("project_name"),
+        }
+    doc = {
+        "ocf_version": "0.1.0",
+        "conversation": conv,
+        "messages": [
+            {
+                "id": "msg_0001",
+                "created_at": "2026-04-26T10:00:01Z",
+                "message": {"role": "user", "content": "Hi"},
+            },
+            {
+                "id": "msg_0002",
+                "created_at": "2026-04-26T10:00:02Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Hello back"}],
+                },
+            },
+        ],
+    }
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_render_directory_writes_md_files(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src_dir = tmp_path / "ocf"
+    src_dir.mkdir()
+    _write_ocf(src_dir / "a.ocf.json", id="conv_a", title="Alpha")
+    _write_ocf(src_dir / "b.ocf.json", id="conv_b", title="Beta")
+    out = tmp_path / "rendered"
+    rc = main(["render", str(src_dir), "--out", str(out)])
+    assert rc == 0
+    md_files = sorted(out.glob("*.md"))
+    assert [p.name for p in md_files] == ["a.md", "b.md"]
+    text = (out / "a.md").read_text(encoding="utf-8")
+    assert "# Alpha" in text
+
+
+def test_render_filter_platform_narrows_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src_dir = tmp_path / "ocf"
+    src_dir.mkdir()
+    _write_ocf(src_dir / "a.ocf.json", id="conv_a", platform="cursor")
+    _write_ocf(src_dir / "b.ocf.json", id="conv_b", platform="claude_code")
+    out = tmp_path / "rendered"
+    rc = main(
+        ["render", str(src_dir), "--out", str(out), "--platform", "cursor"]
+    )
+    assert rc == 0
+    md_files = sorted(out.glob("*.md"))
+    assert [p.name for p in md_files] == ["a.md"]
+
+
+def test_render_filter_query_matches_title(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src_dir = tmp_path / "ocf"
+    src_dir.mkdir()
+    _write_ocf(
+        src_dir / "a.ocf.json",
+        id="conv_a",
+        title="Workspace rename and session migration",
+    )
+    _write_ocf(src_dir / "b.ocf.json", id="conv_b", title="Other thing")
+    out = tmp_path / "rendered"
+    rc = main(
+        [
+            "render",
+            str(src_dir),
+            "--out",
+            str(out),
+            "--query",
+            "workspace rename",
+        ]
+    )
+    assert rc == 0
+    md_files = sorted(out.glob("*.md"))
+    assert [p.name for p in md_files] == ["a.md"]
+
+
+def test_render_no_match_returns_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src_dir = tmp_path / "ocf"
+    src_dir.mkdir()
+    _write_ocf(src_dir / "a.ocf.json")
+    out = tmp_path / "rendered"
+    rc = main(
+        [
+            "render",
+            str(src_dir),
+            "--out",
+            str(out),
+            "--query",
+            "absolutely-no-match-query-xyzzy",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "no OCF documents matched" in err
+
+
+def test_render_dry_run_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src_dir = tmp_path / "ocf"
+    src_dir.mkdir()
+    _write_ocf(src_dir / "a.ocf.json")
+    out = tmp_path / "rendered"
+    rc = main(["render", str(src_dir), "--out", str(out), "--dry-run"])
+    assert rc == 0
+    assert not list(out.glob("*.md"))
+    assert "[dry-run]" in capsys.readouterr().out
+
+
+def test_render_invalid_format_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src_dir = tmp_path / "ocf"
+    src_dir.mkdir()
+    _write_ocf(src_dir / "a.ocf.json")
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "render",
+                str(src_dir),
+                "--out",
+                str(tmp_path / "rendered"),
+                "--format",
+                "pdf",
+            ]
+        )
+
+
+def test_render_invalid_since_returns_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src_dir = tmp_path / "ocf"
+    src_dir.mkdir()
+    _write_ocf(src_dir / "a.ocf.json")
+    rc = main(
+        [
+            "render",
+            str(src_dir),
+            "--out",
+            str(tmp_path / "rendered"),
+            "--since",
+            "not-a-date",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "not a valid ISO date" in err
