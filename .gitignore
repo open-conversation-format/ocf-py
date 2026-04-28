@@ -1,0 +1,28 @@
+# Virtual env
+.venv/
+
+# Build output
+dist/
+build/
+*.egg-info/
+
+# Cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Per-developer Claude Code state
+.claude/
