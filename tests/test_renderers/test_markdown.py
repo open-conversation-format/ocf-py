@@ -477,3 +477,146 @@ def test_select_ocf_files_no_filter_returns_all(tmp_path: Path) -> None:
     _write_doc(a, _minimal_doc())
     selected = select_ocf_files([tmp_path])
     assert selected == [a]
+
+
+# ---------------------------------------------------------------------------
+# Simple profile (Cursor-native-export style)
+# ---------------------------------------------------------------------------
+
+def test_simple_profile_omits_yaml_front_matter() -> None:
+    """Simple profile starts with the H1 directly — no YAML block."""
+    out = MarkdownRenderer(simple=True).render(_minimal_doc())
+    assert out.startswith("# Test Conversation\n")
+    assert "ocf_version:" not in out
+    assert "tags:" not in out
+
+
+def test_simple_profile_uses_export_tagline() -> None:
+    out = MarkdownRenderer(simple=True).render(_minimal_doc())
+    assert "_Exported on " in out
+    assert "from Cursor via ocf-py_" in out
+
+
+def test_simple_profile_uses_platform_specific_assistant_label() -> None:
+    """cursor -> 'Cursor', claude_code -> 'Claude', codex -> 'Codex'."""
+    doc = _minimal_doc()
+    doc["conversation"]["source"]["platform"] = "claude_code"
+    out = MarkdownRenderer(simple=True).render(doc)
+    assert "**Claude**" in out
+    assert "**Cursor**" not in out
+    assert "**Assistant**" not in out
+
+
+def test_simple_profile_uses_hr_separators_between_messages() -> None:
+    out = MarkdownRenderer(simple=True).render(_minimal_doc())
+    # Two messages -> two HR separators (one before each)
+    assert out.count("\n---\n") == 2
+
+
+def test_simple_profile_omits_tool_calls_and_tool_results() -> None:
+    """The whole point of the simple profile: tool calls and tool
+    results disappear, only the natural-language stream remains."""
+    out = MarkdownRenderer(simple=True).render(_doc_with_tool_call())
+    assert "Tool call" not in out
+    assert "Tool result" not in out
+    assert "tool_call_id" not in out
+    assert "edit_file_v2" not in out
+    assert "afterContentId" not in out
+
+
+def test_simple_profile_omits_thinking_blocks() -> None:
+    doc = _minimal_doc()
+    doc["messages"][1]["message"]["content"] = [
+        {"type": "thinking", "thinking": "Internal reasoning here..."},
+        {"type": "text", "text": "Visible answer."},
+    ]
+    out = MarkdownRenderer(simple=True).render(doc)
+    assert "Internal reasoning here" not in out
+    assert "<details>" not in out
+    assert "Thinking" not in out
+    # The visible text is still rendered
+    assert "Visible answer." in out
+
+
+def test_simple_profile_drops_assistant_messages_with_only_tool_calls() -> None:
+    """Cursor's native export skips assistant turns whose only content
+    is a tool call. Without this, the simple output would have stray
+    '**Cursor**' headings followed by nothing."""
+    out = MarkdownRenderer(simple=True).render(_doc_with_tool_call())
+    # Three messages in input: user (text), assistant (tool_call only),
+    # tool (result). Only the user text survives -> exactly one block.
+    blocks = [line for line in out.splitlines() if line.startswith("**")]
+    assert blocks == ["**User**"]
+
+
+def test_simple_profile_omits_per_message_timestamps() -> None:
+    out = MarkdownRenderer(simple=True).render(_minimal_doc())
+    # Full profile would render timestamps as italic sublines on each
+    # message — simple profile drops those entirely.
+    assert "10:00:01" not in out
+    assert "10:00:02" not in out
+
+
+def test_simple_profile_renders_code_blocks_with_language() -> None:
+    doc = _minimal_doc()
+    doc["messages"][1]["message"]["content"] = [
+        {
+            "type": "code",
+            "code": "print('hi')",
+            "language": "python",
+            "filename": "main.py",
+        }
+    ]
+    out = MarkdownRenderer(simple=True).render(doc)
+    assert "_File: `main.py`_" in out
+    assert "```python\nprint('hi')\n```" in out
+
+
+def test_simple_profile_drops_system_and_developer_messages() -> None:
+    """System / developer messages are setup boilerplate (Codex emits
+    a giant developer message at session start). The simple profile
+    is for humans reading the conversation, so these get cut."""
+    doc = _minimal_doc()
+    doc["messages"].insert(
+        0,
+        {
+            "id": "msg_dev",
+            "message": {
+                "role": "developer",
+                "content": "Permissions setup: ...",
+            },
+        },
+    )
+    doc["messages"].insert(
+        0,
+        {
+            "id": "msg_sys",
+            "message": {"role": "system", "content": "You are Codex."},
+        },
+    )
+    out = MarkdownRenderer(simple=True).render(doc)
+    assert "Permissions setup" not in out
+    assert "You are Codex." not in out
+    assert "**Developer**" not in out
+    assert "**System**" not in out
+    # The original two messages still survive.
+    assert "**User**" in out
+
+
+def test_simple_profile_handles_empty_conversation() -> None:
+    doc = _minimal_doc()
+    doc["messages"] = []
+    out = MarkdownRenderer(simple=True).render(doc)
+    assert "# Test Conversation" in out
+    assert "no conversation content" in out
+
+
+def test_full_and_simple_render_same_doc_differently() -> None:
+    """Sanity: same input, very different output sizes."""
+    full = MarkdownRenderer(simple=False).render(_doc_with_tool_call())
+    simple = MarkdownRenderer(simple=True).render(_doc_with_tool_call())
+    # Full has front matter + tool call json + resources scaffolding;
+    # simple has only the user message.
+    assert len(full) > len(simple) * 2
+    assert "tool_call_count:" in full
+    assert "tool_call_count:" not in simple

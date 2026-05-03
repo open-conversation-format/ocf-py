@@ -28,10 +28,29 @@ from __future__ import annotations
 import io
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, ClassVar
 
 from ocf.renderers._base import Renderer
+
+
+# Display labels for the simple profile. Keys match
+# conversation.source.platform values produced by our adapters.
+_PLATFORM_DISPLAY: dict[str, str] = {
+    "cursor": "Cursor",
+    "claude_code": "Claude Code",
+    "codex": "Codex",
+    "claude": "Claude",
+    "chatgpt": "ChatGPT",
+}
+
+_ASSISTANT_LABEL: dict[str, str] = {
+    "cursor": "Cursor",
+    "claude_code": "Claude",
+    "codex": "Codex",
+    "claude": "Claude",
+    "chatgpt": "ChatGPT",
+}
 
 
 _FRONT_MATTER_KEYS_ORDER = (
@@ -53,17 +72,40 @@ _FRONT_MATTER_KEYS_ORDER = (
 
 
 class MarkdownRenderer(Renderer):
-    """Render an OCF document as a single Markdown string."""
+    """Render an OCF document as a single Markdown string.
+
+    Two profiles via the ``simple`` constructor flag:
+
+    - **Default (full)**: YAML front matter, role headings with
+      timestamps, collapsed thinking blocks, fenced tool calls,
+      resources table. Optimized for Obsidian/Meilisearch indexing
+      and forensics — every signal preserved.
+    - **Simple** (``simple=True``): Cursor-native-export-style. Title,
+      one italic export-line, then ``**User**`` / ``**<Assistant>**``
+      blocks separated by ``---``. No tool calls, no thinking, no
+      timestamps. Optimized for human reading.
+    """
 
     name: ClassVar[str] = "markdown"
     suffix: ClassVar[str] = ".md"
     mime: ClassVar[str] = "text/markdown"
 
+    def __init__(self, *, simple: bool = False) -> None:
+        self.simple = simple
+
     def render(self, doc: dict[str, Any]) -> str:
+        if self.simple:
+            return self._render_simple(doc)
+        return self._render_full(doc)
+
+    # ------------------------------------------------------------------
+    # Full profile (existing behavior)
+    # ------------------------------------------------------------------
+
+    def _render_full(self, doc: dict[str, Any]) -> str:
         buf = io.StringIO()
         conv = doc.get("conversation") or {}
 
-        # ---------- YAML front-matter ----------
         fm = _build_front_matter(doc)
         buf.write("---\n")
         for key in _FRONT_MATTER_KEYS_ORDER:
@@ -72,20 +114,17 @@ class MarkdownRenderer(Renderer):
             buf.write(_yaml_line(key, fm[key]))
         buf.write("---\n\n")
 
-        # ---------- H1 + meta block ----------
         title = conv.get("title") or "Untitled Conversation"
         buf.write(f"# {_escape_md_inline(title)}\n\n")
         buf.write(_meta_block(doc))
         buf.write("\n")
 
-        # ---------- Resources index (only when non-empty) ----------
         resources = doc.get("resources") or []
         if resources:
             buf.write("## Resources\n\n")
             buf.write(_render_resources(resources))
             buf.write("\n")
 
-        # ---------- Messages ----------
         buf.write("## Messages\n\n")
         messages = doc.get("messages") or []
         if not messages:
@@ -95,6 +134,67 @@ class MarkdownRenderer(Renderer):
         default_model = conv.get("default_model")
         for env in messages:
             buf.write(_render_envelope(env, default_model=default_model))
+            buf.write("\n")
+
+        return buf.getvalue()
+
+    # ------------------------------------------------------------------
+    # Simple profile (Cursor-native-export style)
+    # ------------------------------------------------------------------
+
+    def _render_simple(self, doc: dict[str, Any]) -> str:
+        """Cursor-style minimalist rendering.
+
+        Drops:
+        - YAML front matter, metadata block, resources table
+        - Per-message timestamps and model labels
+        - Thinking blocks (model-internal monologue)
+        - Tool calls and tool-result messages (only assistant narrative
+          text remains, matching what Cursor's native export emits)
+        - System/developer messages (these are setup boilerplate, not
+          conversation content)
+
+        Keeps:
+        - Conversation title as H1
+        - One italic "Exported on ..." line
+        - User / Assistant blocks with the platform-flavored role label
+          (``**Cursor**`` for cursor, ``**Claude**`` for claude_code,
+          ``**Codex**`` for codex, ``**Assistant**`` otherwise)
+        - Inline code fences and language tags
+        """
+        buf = io.StringIO()
+        conv = doc.get("conversation") or {}
+        source = conv.get("source") or {}
+
+        # ----- Title -----
+        title = conv.get("title") or "Untitled Conversation"
+        buf.write(f"# {_escape_md_inline(title)}\n")
+
+        # ----- Export tagline -----
+        platform = source.get("platform") or "unknown"
+        platform_label = _PLATFORM_DISPLAY.get(platform, platform)
+        export_dt = datetime.now(tz=timezone.utc)
+        buf.write(
+            f"_Exported on {export_dt.strftime('%Y-%m-%d %H:%M UTC')} "
+            f"from {platform_label} via ocf-py_\n\n"
+        )
+
+        # ----- Messages -----
+        assistant_label = _ASSISTANT_LABEL.get(platform, "Assistant")
+        messages = doc.get("messages") or []
+        rendered_blocks: list[str] = []
+        for env in messages:
+            block = _simple_envelope(env, assistant_label=assistant_label)
+            if block is not None:
+                rendered_blocks.append(block)
+
+        if not rendered_blocks:
+            buf.write("---\n\n_(no conversation content)_\n")
+            return buf.getvalue()
+
+        for block in rendered_blocks:
+            buf.write("---\n\n")
+            buf.write(block)
             buf.write("\n")
 
         return buf.getvalue()
@@ -351,6 +451,71 @@ def _render_envelope(env: dict[str, Any], *, default_model: str | None) -> str:
             out.write(_render_tool_call(call))
 
     return out.getvalue()
+
+
+def _simple_envelope(
+    env: dict[str, Any], *, assistant_label: str
+) -> str | None:
+    """Render one message envelope in the Cursor-native simple style.
+
+    Returns ``None`` when the envelope produces no visible output —
+    this is how we drop tool/tool-result/system/developer messages
+    silently without leaving empty ``---`` separators in the output.
+    """
+    msg = env.get("message") or {}
+    role = msg.get("role")
+
+    # Filter: only user + assistant survive in the simple profile.
+    # Skipping these matches Cursor's native export, which emits only
+    # the natural-language stream of the conversation.
+    if role not in ("user", "assistant"):
+        return None
+
+    content = msg.get("content")
+    body_parts: list[str] = []
+    if isinstance(content, str):
+        if content.strip():
+            body_parts.append(content.rstrip())
+    elif isinstance(content, list):
+        for block in content:
+            text = _simple_block(block)
+            if text:
+                body_parts.append(text)
+
+    # Assistant messages with no visible content (e.g. tool-call-only)
+    # are dropped — there's nothing for a reader to see.
+    if not body_parts:
+        return None
+
+    label = "User" if role == "user" else assistant_label
+    body = "\n\n".join(body_parts).rstrip()
+    return f"**{label}**\n\n{body}\n"
+
+
+def _simple_block(block: Any) -> str | None:
+    """Pick the text-bearing OCF blocks for the simple profile.
+
+    Drops thinking, tool_use/result, image, file, audio, resource_ref —
+    mirrors what Cursor's own export omits.
+    """
+    if not isinstance(block, dict):
+        return None
+    btype = block.get("type")
+    if btype == "text":
+        text = block.get("text") or ""
+        return text.rstrip() or None
+    if btype == "code":
+        code = block.get("code") or ""
+        lang = block.get("language") or ""
+        # Filename hint goes inline before the fence so the export
+        # remains greppable for "where was this code from".
+        filename = block.get("filename")
+        head = ""
+        if isinstance(filename, str) and filename:
+            head = f"_File: `{filename}`_\n\n"
+        return f"{head}```{lang}\n{code.rstrip()}\n```"
+    # thinking, image_url, input_audio, file, resource_ref → skip
+    return None
 
 
 def _render_block(block: Any) -> str:

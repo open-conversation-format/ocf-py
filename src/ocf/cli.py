@@ -285,6 +285,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress per-file lines; print only the summary.",
     )
+    p_render.add_argument(
+        "--simple",
+        action="store_true",
+        help=(
+            "Cursor-native-export-style output: H1 title, '---' "
+            "separators, no front matter / no tool calls / no "
+            "thinking blocks. Optimized for human reading rather "
+            "than indexing."
+        ),
+    )
 
     # ---- watch --------------------------------------------------------
     watch_choices = sorted(WATCHERS)
@@ -392,7 +402,12 @@ def _cmd_render(args: argparse.Namespace) -> int:
     from datetime import datetime
 
     renderer_cls = RENDERERS[args.format]
-    renderer = renderer_cls()
+    # Only the Markdown renderer takes a simple flag today; pass it
+    # selectively so other renderer classes don't get unexpected kwargs.
+    if renderer_cls.__name__ == "MarkdownRenderer":
+        renderer = renderer_cls(simple=args.simple)
+    else:
+        renderer = renderer_cls()
 
     since: datetime | None = None
     if args.since is not None:
