@@ -48,6 +48,7 @@ from ocf.exporters import codex as _codex
 from ocf.exporters import cursor as _cursor
 from ocf.exporters._base import AmbiguousMatchError
 from ocf.renderers import RENDERERS, render_all, select_ocf_files
+from ocf.watchers import WATCHERS, WatchState
 
 # Tool dispatch table. Aliases (``claude-code``) point at the same
 # module object so argparse accepts either spelling. Sorted display in
@@ -76,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_list(args)
         if args.command == "render":
             return _cmd_render(args)
+        if args.command == "watch":
+            return _cmd_watch(args)
     except FileNotFoundError as exc:
         # Missing source directory is a user/environment problem, not a bug.
         print(f"error: {exc}", file=sys.stderr)
@@ -283,6 +286,38 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Suppress per-file lines; print only the summary.",
     )
 
+    # ---- watch --------------------------------------------------------
+    watch_choices = sorted(WATCHERS)
+    p_watch = sub.add_parser(
+        "watch",
+        help="Live-monitor a tool's sessions for new / empty / ghost behavior.",
+        description=(
+            "Poll the tool's session storage on a fixed interval and "
+            "emit events as new sessions appear, messages get appended, "
+            "tool calls happen, or composers stay empty past a threshold "
+            "(Cursor-specific ghost-session detection). Press Ctrl+C to "
+            "exit."
+        ),
+    )
+    p_watch.add_argument(
+        "tool",
+        choices=watch_choices,
+        metavar="TOOL",
+        help=f"Currently supported: {', '.join(watch_choices)}.",
+    )
+    p_watch.add_argument(
+        "--interval",
+        type=float,
+        default=5.0,
+        help="Poll interval in seconds (default: 5).",
+    )
+    p_watch.add_argument(
+        "--no-ui",
+        dest="no_ui",
+        action="store_true",
+        help="Plain stdout instead of the Rich live UI (cron-friendly).",
+    )
+
     return parser
 
 
@@ -409,6 +444,105 @@ def _cmd_render(args: argparse.Namespace) -> int:
             print(f"FAILED   {src}: {msg}", file=sys.stderr)
         return 1
     return 0
+
+
+def _cmd_watch(args: argparse.Namespace) -> int:
+    import time
+
+    watcher_cls = WATCHERS[args.tool]
+    watcher = watcher_cls()
+    state = WatchState()
+
+    # Initial snapshot is the baseline — we don't fire session_started
+    # for sessions that already exist when the watcher starts (or every
+    # cold start would alarm-flood with all 350 cursor composers as
+    # "new"), and we also pre-mark the empty-composer warning slots so
+    # ghost-session alerts are only emitted for composers that go ghost
+    # *during this watch run*, not for historical leftovers. For
+    # non-empty composers we seed state.last_totals so the first
+    # message_appended event reports a true delta against the baseline,
+    # not a raw total.
+    prev = watcher.snapshot()
+    for sid, sess in prev.sessions.items():
+        state.seen_session_started.add(sid)
+        state.fired_30min_warning.add(sid)
+        state.fired_60min_warning.add(sid)
+        if sess.bubble_count > 0:
+            # Adapter-specific: trigger a one-time scan so totals are
+            # populated for the running session. Cursor watcher exposes
+            # the helper as a public-ish private method.
+            try:
+                u, a, t, ti, to = watcher._scan_delta_bubbles(sid, 0)  # noqa: SLF001
+                state.last_totals[sid] = {
+                    "user": u, "assistant": a, "tools": t,
+                    "tokens_in": ti, "tokens_out": to,
+                }
+            except Exception:
+                pass
+
+    if args.no_ui:
+        return _watch_loop_plain(watcher, prev, state, args.interval)
+    return _watch_loop_rich(watcher, prev, state, args.interval)
+
+
+def _watch_loop_plain(watcher, prev, state, interval: float) -> int:
+    import time
+    # Force line-buffered stdout: in --no-ui we typically pipe to tee
+    # / a file, where Python's default block-buffering hides events
+    # until many KB have accumulated. Flush every line keeps tail -f
+    # honest.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    print(
+        f"watching {watcher.name}: {len(prev.sessions)} sessions baseline; "
+        f"polling every {interval}s. Ctrl+C to stop.",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        while True:
+            time.sleep(interval)
+            current = watcher.snapshot()
+            for ev in watcher.diff(prev, current, state):
+                ts = ev.timestamp.strftime("%H:%M:%S")
+                title = f' "{ev.title}"' if ev.title else ""
+                print(
+                    f"{ts}  {ev.severity:<7}  {ev.kind:<17}  "
+                    f"{ev.session_id[:8]}{title}  {ev.detail or ''}",
+                    flush=True,
+                )
+            prev = current
+    except KeyboardInterrupt:
+        print("\nstopped", file=sys.stderr, flush=True)
+        return 0
+
+
+def _watch_loop_rich(watcher, prev, state, interval: float) -> int:
+    import time
+    from rich.live import Live
+    from ocf.watchers.rich_ui import WatchUI, get_console
+
+    ui = WatchUI(adapter_name=watcher.name)
+    console = get_console()
+
+    try:
+        with Live(
+            ui.render(prev),
+            console=console,
+            refresh_per_second=4,
+            screen=True,
+        ) as live:
+            while True:
+                time.sleep(interval)
+                current = watcher.snapshot()
+                events = list(watcher.diff(prev, current, state))
+                ui.push(events)
+                live.update(ui.render(current))
+                prev = current
+    except KeyboardInterrupt:
+        return 0
 
 
 __all__ = ["main"]

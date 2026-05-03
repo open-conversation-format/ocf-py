@@ -22,6 +22,7 @@ classifiers = [
 dependencies = [
     "orjson>=3.10",
     "jsonschema>=4.20",
+    "rich>=13",
 ]
 
 [project.optional-dependencies]
