@@ -58,6 +58,7 @@ from ocf import __version__
 from ocf.core.schema import validate_strict
 from ocf.exporters._base import (
     AmbiguousMatchError,
+    SessionInfo,
     SkipExport,
     SourceAdapter,
     export_all as _export_all_generic,
@@ -231,6 +232,54 @@ class CursorAdapter(SourceAdapter):
                 h.update(b"|")
                 h.update(v.encode("utf-8") if v is not None else NULL_VALUE)
         return (db_stat.st_mtime_ns, db_stat.st_size, h.hexdigest())
+
+    # ----- Session info (for ``ocf list``) ----------------------------------
+
+    def session_info(self, source: Path) -> SessionInfo:
+        """Peek composerData for title, workspace folder, and createdAt."""
+        try:
+            db_path, composer_id = _split_source_token(source)
+        except ValueError:
+            return SessionInfo(source=source, session_id=source.stem)
+
+        title: str | None = None
+        project: str | None = None
+        created_at: datetime | None = None
+
+        try:
+            with open_ro(db_path) as conn:
+                row = conn.execute(
+                    "SELECT value FROM cursorDiskKV WHERE key = ?",
+                    (COMPOSER_KEY_PREFIX + composer_id,),
+                ).fetchone()
+                if row and row["value"]:
+                    cdata = json.loads(row["value"])
+                    title = (
+                        cdata.get("name")
+                        or cdata.get("title")
+                        or (cdata.get("latestConversationSummary") or {}).get("title")
+                    )
+                    if not isinstance(title, str):
+                        title = None
+                    wf = cdata.get("workspaceFolder")
+                    if isinstance(wf, str) and wf:
+                        parts = _split_path(wf)
+                        project = parts[-1] if parts else wf
+                    ca = cdata.get("createdAt")
+                    if isinstance(ca, (int, float)):
+                        created_at = datetime.fromtimestamp(
+                            ca / 1000, tz=timezone.utc
+                        )
+        except (sqlite3.Error, json.JSONDecodeError, TypeError):
+            pass
+
+        return SessionInfo(
+            source=source,
+            session_id=composer_id,
+            title=title,
+            project=project,
+            created_at=created_at,
+        )
 
     # ----- helpers ---------------------------------------------------------
 

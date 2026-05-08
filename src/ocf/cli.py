@@ -5,17 +5,19 @@ wrapper over the source adapters in :mod:`ocf.exporters`. It exists
 so you can drop a one-line cron job somewhere and stop thinking about
 incremental archival of your AI sessions::
 
-    ocf export codex        --out ~/ocf-archive
-    ocf export claude_code  --out ~/ocf-archive
-    ocf export cursor       --out ~/ocf-archive
+    ocf export codex           --out ~/ocf-archive
+    ocf export claude-code-cli --out ~/ocf-archive
+    ocf export claude-code-app --out ~/ocf-archive
+    ocf export claude-cowork-app --out ~/ocf-archive
+    ocf export cursor          --out ~/ocf-archive
 
-All three exporters share the manifest, so re-running is fast — only
-new or modified sessions get re-converted. Pair it with the ``--source``
+All exporters share the manifest, so re-running is fast — only new or
+modified sessions get re-converted. Pair it with the ``--source``
 locator to grab a single session by UUID, by file/directory path, or by
 fuzzy title query::
 
-    ocf export claude_code --out ./out --source "HGF Migration"
-    ocf export cursor      --out ./out --source 06984dd8-3c87-44b8-92e5-90237e74eb94
+    ocf export claude-code-app --out ./out --source "HGF Migration"
+    ocf export cursor          --out ./out --source 06984dd8-3c87-44b8-92e5-90237e74eb94
 
 The ``list`` subcommand mirrors discovery without touching the output
 side, useful for sanity-checking what a tool can see on this machine
@@ -29,35 +31,111 @@ Design notes
 - **Exit codes:** 0 on full success, 1 if any source failed conversion
   or no source matched ``--source``, 2 on user/environment errors
   (missing source dir), 130 on Ctrl-C.
-- **Exporter modules are interchangeable** because they all expose the
-  same module-level shim API (``export_all``, ``resolve_sources``,
-  ``discover``). A tool registry maps tool name -> module.
+- **Tool registry** maps CLI tool names to either exporter *modules*
+  (codex, cursor) or :class:`_AdapterShim` wrappers around
+  :class:`SourceAdapter` subclasses (the Claude variants).
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Iterable
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 from ocf import __version__
-from ocf.exporters import claude_code as _cc
 from ocf.exporters import codex as _codex
 from ocf.exporters import cursor as _cursor
-from ocf.exporters._base import AmbiguousMatchError
+from ocf.exporters._base import (
+    AmbiguousMatchError,
+    SessionInfo,
+    SkipExport,
+    SourceAdapter,
+    export_all as _export_all_generic,
+)
+from ocf.exporters._common import ExportResult
+from ocf.exporters.claude_code import (
+    ClaudeCodeCliAdapter,
+    ClaudeCodeAppAdapter,
+    ClaudeCoworkAppAdapter,
+)
+from ocf.exporters.codex import CodexAdapter
+from ocf.exporters.cursor import CursorAdapter
 from ocf.renderers import RENDERERS, render_all, select_ocf_files
 from ocf.watchers import WATCHERS, WatchState
 
-# Tool dispatch table. Aliases (``claude-code``) point at the same
-# module object so argparse accepts either spelling. Sorted display in
-# ``--help`` is achieved by passing ``choices`` to argparse separately.
-_TOOLS: dict[str, ModuleType] = {
-    "codex": _codex,
-    "claude_code": _cc,
-    "claude-code": _cc,
-    "cursor": _cursor,
+
+# ---------------------------------------------------------------------------
+# Adapter shim: adapts a SourceAdapter to the module-level API shape
+# ---------------------------------------------------------------------------
+
+class _AdapterShim:
+    """Wrap a :class:`SourceAdapter` into the duck-typed module API.
+
+    The CLI dispatches to tool backends via ``tool.export_all()``,
+    ``tool.discover()``, ``tool.resolve_sources()``. Exporter modules
+    (codex, cursor) expose these as module-level functions; the Claude
+    variant adapters use this shim. All tool entries also expose
+    ``.adapter`` for features that need the adapter directly (``list``
+    with session_info, ``render --tool`` pipeline).
+    """
+
+    def __init__(self, adapter: SourceAdapter) -> None:
+        self.adapter = adapter
+
+    def discover(
+        self, source_dir: list[Path] | Path | None = None
+    ) -> list[Path]:
+        return self.adapter.discover(source_dir)
+
+    def resolve_sources(
+        self,
+        source: Path | str | None,
+        *,
+        source_dir: list[Path] | Path | None = None,
+        case_sensitive: bool = False,
+    ) -> list[Path]:
+        return self.adapter.resolve_sources(
+            source, source_dirs=source_dir, case_sensitive=case_sensitive
+        )
+
+    def export_all(
+        self,
+        out_dir: Path,
+        *,
+        sources: Iterable[Path] | None = None,
+        source_dir: list[Path] | Path | None = None,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> ExportResult:
+        if sources is None and source_dir is not None:
+            dirs = source_dir if isinstance(source_dir, list) else [source_dir]
+            for d in dirs:
+                if not Path(d).exists():
+                    raise FileNotFoundError(
+                        f"Source directory not found: {d}"
+                    )
+        return _export_all_generic(
+            self.adapter,
+            out_dir,
+            sources=sources,
+            source_dirs=source_dir,
+            force=force,
+            dry_run=dry_run,
+        )
+
+
+# Tool dispatch table. Every entry is an _AdapterShim wrapping the
+# tool's SourceAdapter. This gives uniform access to both the
+# module-level API (discover, export_all, resolve_sources) and the
+# adapter itself (session_info, export_one).
+_TOOLS: dict[str, _AdapterShim] = {
+    "codex": _AdapterShim(CodexAdapter()),
+    "claude-code-cli": _AdapterShim(ClaudeCodeCliAdapter()),
+    "claude-code-app": _AdapterShim(ClaudeCodeAppAdapter()),
+    "claude-cowork-app": _AdapterShim(ClaudeCoworkAppAdapter()),
+    "cursor": _AdapterShim(CursorAdapter()),
 }
 
 
@@ -132,7 +210,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_export.add_argument(
         "tool",
         choices=_TOOL_CHOICES,
-        metavar="TOOL",
         help=f"One of: {', '.join(_TOOL_CHOICES)}",
     )
     p_export.add_argument(
@@ -181,17 +258,17 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- list ---------------------------------------------------------
     p_list = sub.add_parser(
         "list",
-        help="List discovered sessions for a tool.",
+        help="List discovered sessions with metadata (title, project, date).",
         description=(
-            "Print the sessions a tool can see in its default source "
-            "directory (or the path passed to --source-dir). Useful for "
-            "verifying a fresh install before running export."
+            "Show the sessions a tool can see in its default source "
+            "directory (or the path passed to --source-dir). Default "
+            "output is a formatted table with title, project, date, and "
+            "model. Use --paths for raw file paths (pipe-friendly)."
         ),
     )
     p_list.add_argument(
         "tool",
         choices=_TOOL_CHOICES,
-        metavar="TOOL",
         help=f"One of: {', '.join(_TOOL_CHOICES)}",
     )
     p_list.add_argument(
@@ -200,6 +277,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         type=Path,
         help="Override the tool's default source directory.",
+    )
+    p_list.add_argument(
+        "--paths",
+        action="store_true",
+        help="Output raw file paths instead of a formatted table.",
     )
     p_list.add_argument(
         "--query",
@@ -211,23 +293,53 @@ def _build_parser() -> argparse.ArgumentParser:
     render_format_choices = sorted(set(RENDERERS))
     p_render = sub.add_parser(
         "render",
-        help="Render OCF documents to a human-readable format (Markdown).",
+        help="Render sessions or OCF documents to Markdown.",
         description=(
-            "Convert OCF documents into Markdown (default) or any other "
-            "registered renderer format. Selection happens against OCF "
-            "fields (title, platform, project, id) — sources are not "
-            "touched. The render manifest tracks per-file hashes so "
-            "re-runs only re-render changed inputs."
+            "Two modes:\n\n"
+            "  Direct:  ocf render --tool claude-code-cli --source 'HGF' --out ./md --simple\n"
+            "  From OCF: ocf render ./ocf-archive/ --out ./md\n\n"
+            "Direct mode (--tool) exports source sessions to OCF in-memory, "
+            "then renders to Markdown in one step. From-OCF mode reads "
+            "existing *.ocf.json files. Both support all filter and "
+            "formatting flags."
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_render.add_argument(
         "input",
-        nargs="+",
+        nargs="*",
         type=Path,
+        default=None,
         help=(
-            "One or more OCF files or directories containing *.ocf.json. "
-            "Directories are recursed."
+            "OCF files or directories containing *.ocf.json. "
+            "Not needed when --tool is used."
         ),
+    )
+    p_render.add_argument(
+        "--tool",
+        dest="tool",
+        choices=_TOOL_CHOICES,
+        default=None,
+        help=(
+            "Source tool for direct rendering (skips the OCF export step). "
+            "Discovers sessions from the tool's storage and renders them "
+            "to Markdown in one pipeline."
+        ),
+    )
+    p_render.add_argument(
+        "--source",
+        default=None,
+        help=(
+            "Session locator for --tool mode: UUID, file path, or "
+            "fuzzy title query. Without this, all sessions are rendered."
+        ),
+    )
+    p_render.add_argument(
+        "--source-dir",
+        dest="render_source_dir",
+        default=None,
+        type=Path,
+        help="Override the tool's default source directory (--tool mode only).",
     )
     p_render.add_argument(
         "--out",
@@ -312,7 +424,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument(
         "tool",
         choices=watch_choices,
-        metavar="TOOL",
         help=f"Currently supported: {', '.join(watch_choices)}.",
     )
     p_watch.add_argument(
@@ -384,22 +495,84 @@ def _cmd_export(args: argparse.Namespace) -> int:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
-    module = _TOOLS[args.tool]
+    tool = _TOOLS[args.tool]
     source_dir = args.source_dir
 
     if args.query is not None:
-        sources = module.resolve_sources(args.query, source_dir=source_dir)
+        sources = tool.resolve_sources(args.query, source_dir=source_dir)
     else:
-        sources = module.discover(source_dir=source_dir)
+        sources = tool.discover(source_dir=source_dir)
 
+    if args.paths:
+        # Raw mode: one path per line (pipe-friendly, backward compat)
+        for s in sources:
+            print(s)
+        print(f"total: {len(sources)}", file=sys.stderr)
+        return 0
+
+    # Collect session metadata for a human-readable table
+    adapter = tool.adapter
+    infos: list[SessionInfo] = []
     for s in sources:
-        print(s)
-    print(f"total: {len(sources)}", file=sys.stderr)
+        try:
+            infos.append(adapter.session_info(s))
+        except Exception:
+            infos.append(SessionInfo(source=s, session_id=s.stem))
+
+    _print_session_table(infos)
+    print(f"total: {len(infos)}", file=sys.stderr)
     return 0
+
+
+def _print_session_table(infos: list[SessionInfo]) -> None:
+    """Print a formatted session table to stdout."""
+    if not infos:
+        return
+
+    # Column widths: ID 8, Title 40, Project 20, Date 10, Model 20
+    hdr = (
+        f"{'ID':<8}  {'Title':<40}  {'Project':<20}  "
+        f"{'Created':<10}  {'Model':<20}"
+    )
+    sep = (
+        f"{'-'*8}  {'-'*40}  {'-'*20}  {'-'*10}  {'-'*20}"
+    )
+    print(hdr)
+    print(sep)
+
+    for info in infos:
+        sid = info.session_id[:8]
+        title = (info.title or "-")[:40]
+        project = (info.project or "-")[:20]
+        date = (
+            info.created_at.strftime("%Y-%m-%d")
+            if info.created_at
+            else "-"
+        )
+        model = (info.model or "-")[:20]
+        print(f"{sid:<8}  {title:<40}  {project:<20}  {date:<10}  {model:<20}")
 
 
 def _cmd_render(args: argparse.Namespace) -> int:
     from datetime import datetime
+
+    # ---- validation of mutually exclusive modes --------------------------
+    has_tool = args.tool is not None
+    has_input = bool(args.input)
+
+    if not has_tool and not has_input:
+        print(
+            "error: specify either --tool <TOOL> (direct pipeline) or "
+            "positional input paths (OCF files)",
+            file=sys.stderr,
+        )
+        return 2
+    if has_tool and has_input:
+        print(
+            "error: --tool and positional input paths are mutually exclusive",
+            file=sys.stderr,
+        )
+        return 2
 
     renderer_cls = RENDERERS[args.format]
     # Only the Markdown renderer takes a simple flag today; pass it
@@ -409,6 +582,11 @@ def _cmd_render(args: argparse.Namespace) -> int:
     else:
         renderer = renderer_cls()
 
+    # ---- Direct pipeline: --tool mode ------------------------------------
+    if has_tool:
+        return _render_from_tool(args, renderer)
+
+    # ---- From-OCF mode: positional input paths ---------------------------
     since: datetime | None = None
     if args.since is not None:
         try:
@@ -459,6 +637,85 @@ def _cmd_render(args: argparse.Namespace) -> int:
             print(f"FAILED   {src}: {msg}", file=sys.stderr)
         return 1
     return 0
+
+
+def _render_from_tool(args: argparse.Namespace, renderer: Any) -> int:
+    """Direct pipeline: source → OCF (in memory) → rendered output.
+
+    No intermediate OCF files on disk. Each session is exported,
+    rendered, and written in one pass.
+    """
+    import os
+
+    tool = _TOOLS[args.tool]
+    adapter = tool.adapter
+    source_dir = getattr(args, "render_source_dir", None)
+
+    # Discover or resolve sessions
+    if args.source is not None:
+        sources = tool.resolve_sources(args.source, source_dir=source_dir)
+        if not sources:
+            print(
+                f"no sessions matched: {args.source!r}",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        sources = tool.discover(source_dir=source_dir)
+
+    if not sources:
+        print("no sessions found", file=sys.stderr)
+        return 1
+    if not args.quiet:
+        print(f"rendering {len(sources)} session(s) from {args.tool}")
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    new_count = 0
+    skip_count = 0
+    fail_count = 0
+
+    for src in sources:
+        try:
+            doc = adapter.export_one(src, validate=False)
+        except SkipExport:
+            skip_count += 1
+            continue
+        except Exception as exc:
+            if not args.quiet:
+                print(f"FAILED   {src}: {exc}", file=sys.stderr)
+            fail_count += 1
+            continue
+
+        # Render to output
+        try:
+            rendered = renderer.render(doc)
+        except Exception as exc:
+            if not args.quiet:
+                print(f"FAILED   {src} (render): {exc}", file=sys.stderr)
+            fail_count += 1
+            continue
+
+        ocf_name = adapter.ocf_filename_for(src)
+        out_name = renderer.output_filename_for(Path(ocf_name))
+        out_path = out_dir / out_name
+
+        if not args.dry_run:
+            tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+            tmp.write_text(rendered, encoding="utf-8")
+            os.replace(tmp, out_path)
+
+        if not args.quiet and not args.dry_run:
+            print(f"new      {out_path}")
+        new_count += 1
+
+    label = "[dry-run] " if args.dry_run else ""
+    print(
+        f"{label}{new_count} rendered, {skip_count} skipped, "
+        f"{fail_count} failed"
+    )
+    return 1 if fail_count else 0
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:

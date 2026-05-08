@@ -22,6 +22,7 @@ import os
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar
@@ -41,6 +42,27 @@ _UUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?"
     r"[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$"
 )
+
+
+# ---------------------------------------------------------------------------
+# Lightweight session metadata (for ``list`` UI)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SessionInfo:
+    """Minimal session metadata for display in ``ocf list``.
+
+    Adapters produce these from :meth:`SourceAdapter.session_info`
+    (cheap peek, no full conversion). The CLI uses them to render a
+    human-readable table instead of dumping raw file paths.
+    """
+
+    source: Path
+    session_id: str
+    title: str | None = None
+    project: str | None = None
+    created_at: datetime | None = None
+    model: str | None = None
 
 
 class AmbiguousMatchError(LookupError):
@@ -124,6 +146,19 @@ class SourceAdapter(ABC):
         """
 
     # ------------------------------------------------------------------
+    # Session info (overridable — for ``ocf list`` display)
+    # ------------------------------------------------------------------
+
+    def session_info(self, source: Path) -> SessionInfo:
+        """Lightweight metadata peek for one source.
+
+        Default returns just the path and stem. Adapters override to
+        peek the file for title, cwd, date. Called once per discovered
+        source in ``ocf list``; keep it fast.
+        """
+        return SessionInfo(source=source, session_id=source.stem)
+
+    # ------------------------------------------------------------------
     # Source fingerprinting (overridable for non-file sources)
     # ------------------------------------------------------------------
 
@@ -175,9 +210,15 @@ class SourceAdapter(ABC):
         dirs = self._normalize_source_dirs(source_dirs)
         results: list[Path] = []
         for d in dirs:
-            if not d.exists() or not d.is_dir():
+            # EAFP: skip the exists()/is_dir() guard and let rglob
+            # discover what's there.  Some Windows terminal emulators
+            # (cmder/ConEmu) hook GetFileAttributesW in ways that make
+            # Path.exists() return False for directories that DO exist,
+            # while FindFirstFileW (used by rglob via os.scandir) works.
+            try:
+                results.extend(sorted(d.rglob(self.rollout_glob)))
+            except OSError:
                 continue
-            results.extend(sorted(d.rglob(self.rollout_glob)))
         return results
 
     def find_by_name(
@@ -433,6 +474,7 @@ def _now_iso() -> str:
 
 __all__ = [
     "AmbiguousMatchError",
+    "SessionInfo",
     "SkipExport",
     "SourceAdapter",
     "export_all",

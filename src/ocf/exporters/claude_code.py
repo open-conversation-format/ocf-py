@@ -84,6 +84,7 @@ from ocf import __version__
 from ocf.core.schema import validate_strict
 from ocf.exporters._base import (
     AmbiguousMatchError,
+    SessionInfo,
     SkipExport,
     SourceAdapter,
     export_all as _export_all_generic,
@@ -128,12 +129,19 @@ def load_metadata_index(
 
     Each file at ``<root>/<acc>/<org>/local_<sid>.json`` is one
     session's metadata. We ignore failures and return what we can.
+
+    Note: avoids ``Path.exists()`` guard because some Windows terminal
+    emulators (cmder/ConEmu) return ``False`` for directories that
+    actually exist — the underlying ``GetFileAttributesW`` is hooked
+    differently than ``FindFirstFileW`` used by ``rglob``.
     """
     root = metadata_index_path(metadata_dir)
-    if not root.exists() or not root.is_dir():
-        return {}
     index: dict[str, dict[str, Any]] = {}
-    for path in root.rglob("local_*.json"):
+    try:
+        paths = list(root.rglob("local_*.json"))
+    except OSError:
+        return {}
+    for path in paths:
         try:
             with path.open(encoding="utf-8") as fh:
                 row = json.load(fh)
@@ -244,6 +252,63 @@ class ClaudeCodeAdapter(SourceAdapter):
             return f"{stem}-{parent_hash}.ocf.json"
         return f"{stem}.ocf.json"
 
+    # ----- Session info (for ``ocf list``) ----------------------------------
+
+    def session_info(self, source: Path) -> SessionInfo:
+        """Cheap metadata peek for one Claude Code session.
+
+        Strategy:
+        1. Desktop metadata index (in-memory, zero I/O) — gives title,
+           cwd, model for App/Cowork sessions.
+        2. JSONL peek (first ~20 events) — gives cwd, model, created_at
+           from ``system`` event, and title from ``ai-title`` if it
+           appears early. CLI sessions rely on this.
+        """
+        session_id = source.stem
+        index = self._resolve_metadata_index()
+        meta = index.get(session_id) or {}
+
+        title = meta.get("title") if isinstance(meta.get("title"), str) else None
+        cwd = meta.get("cwd") if isinstance(meta.get("cwd"), str) else None
+        model = meta.get("model") if isinstance(meta.get("model"), str) else None
+        created_at: datetime | None = None
+
+        # Peek the JSONL: first few events for system metadata (cwd,
+        # model, created_at), then a reverse scan of the tail for
+        # ai-title (which comes after the first assistant turn and
+        # can be at event 50+ in tool-heavy sessions).
+        try:
+            for i, ev in enumerate(iter_jsonl_tailsafe(source)):
+                if i > 10:
+                    break
+                ts = _parse_iso(ev.get("timestamp"))
+                if created_at is None and ts is not None:
+                    created_at = ts
+                etype = ev.get("type")
+                if etype == EVENT_SYSTEM:
+                    if not cwd and isinstance(ev.get("cwd"), str):
+                        cwd = ev["cwd"]
+                    if not model and isinstance(ev.get("model"), str):
+                        model = ev["model"]
+                elif etype == EVENT_AI_TITLE:
+                    if not title and isinstance(ev.get("title"), str):
+                        title = ev["title"]
+        except OSError:
+            pass
+
+        # Reverse-peek for ai-title if we didn't find one yet
+        if not title:
+            title = _peek_ai_title_tail(source)
+
+        return SessionInfo(
+            source=source,
+            session_id=session_id,
+            title=title,
+            project=_project_name(cwd) if cwd else None,
+            created_at=created_at,
+            model=model,
+        )
+
     # ----- Internal helpers -----------------------------------------------
 
     def _resolve_metadata_index(self) -> dict[str, dict[str, Any]]:
@@ -295,8 +360,74 @@ class ClaudeCodeAdapter(SourceAdapter):
 
 
 # ---------------------------------------------------------------------------
+# Variant adapters: split by storage origin
+# ---------------------------------------------------------------------------
+
+class ClaudeCodeCliAdapter(ClaudeCodeAdapter):
+    """Sessions created by Claude Code CLI or IDE extensions.
+
+    Scans ``~/.claude/projects/`` and filters OUT sessions whose UUID
+    appears in the Desktop App metadata index (those are owned by
+    :class:`ClaudeCodeAppAdapter` instead).
+
+    The partition is clean: CLI session UUID never appears in the
+    Desktop App's ``claude-code-sessions/`` metadata directory, and
+    Desktop App sessions always have an entry there.
+    """
+
+    name: ClassVar[str] = "claude_code_cli"
+
+    def default_source_dirs(self) -> list[Path]:
+        return [claude_code_projects_dir()]
+
+    def discover(
+        self, source_dirs: list[Path] | Path | None = None
+    ) -> list[Path]:
+        all_files = super().discover(source_dirs)
+        index = self._resolve_metadata_index()
+        return [f for f in all_files if f.stem not in index]
+
+
+class ClaudeCodeAppAdapter(ClaudeCodeAdapter):
+    """Sessions created or managed by the Claude Desktop App.
+
+    Scans ``~/.claude/projects/`` and keeps ONLY sessions whose UUID
+    has a matching entry in the Desktop App metadata index
+    (``claude-code-sessions/<acc>/<org>/local_<cliSessionId>.json``).
+    """
+
+    name: ClassVar[str] = "claude_code_app"
+
+    def default_source_dirs(self) -> list[Path]:
+        return [claude_code_projects_dir()]
+
+    def discover(
+        self, source_dirs: list[Path] | Path | None = None
+    ) -> list[Path]:
+        all_files = super().discover(source_dirs)
+        index = self._resolve_metadata_index()
+        return [f for f in all_files if f.stem in index]
+
+
+class ClaudeCoworkAppAdapter(ClaudeCodeAdapter):
+    """Background Agent ("Cowork") sessions from the Claude Desktop App.
+
+    Scans ``<APPDATA>/Claude/local-agent-mode-sessions/`` only.
+    Each spawned background agent gets its own sandboxed worktree
+    with ``.claude/projects/<encoded>/*.jsonl`` inside.
+    """
+
+    name: ClassVar[str] = "claude_cowork_app"
+
+    def default_source_dirs(self) -> list[Path]:
+        return [claude_code_desktop_agent_mode_sessions_dir()]
+
+
+# ---------------------------------------------------------------------------
 # Module-level shims (mirrors the codex.py pattern)
 # ---------------------------------------------------------------------------
+# These expose the *combined* adapter for backward-compatible library use.
+# The CLI dispatches to the variant adapters above via _AdapterShim.
 
 DEFAULT_SOURCE_DIR_FN = claude_code_projects_dir
 MAPPING_ID = ClaudeCodeAdapter.mapping_id
@@ -826,6 +957,44 @@ def _envelope_from_tool_result_block(
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _peek_ai_title_tail(path: Path, tail_bytes: int = 8192) -> str | None:
+    """Read the last few KB of a JSONL to find an ``ai-title`` event.
+
+    ai-title events appear after the first assistant response, which
+    can be dozens of events deep in tool-heavy sessions. Reading the
+    whole file is too expensive for 1000+ sessions; instead we read
+    the tail and parse any complete JSON lines found there.
+    """
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            return None
+        with path.open("rb") as fh:
+            offset = max(0, size - tail_bytes)
+            fh.seek(offset)
+            chunk = fh.read()
+        # Decode and split into lines; first line may be partial — skip it
+        text = chunk.decode("utf-8", errors="replace")
+        lines = text.split("\n")
+        if offset > 0:
+            lines = lines[1:]  # first line is likely partial
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if ev.get("type") == EVENT_AI_TITLE:
+                t = ev.get("title")
+                if isinstance(t, str) and t:
+                    return t
+    except OSError:
+        pass
+    return None
+
+
 def _peek_cwd(path: Path) -> str | None:
     """Read first few events to find the cwd field."""
     try:
@@ -892,6 +1061,9 @@ __all__ = [
     "ROLLOUT_GLOB",
     "AmbiguousMatchError",
     "ClaudeCodeAdapter",
+    "ClaudeCodeCliAdapter",
+    "ClaudeCodeAppAdapter",
+    "ClaudeCoworkAppAdapter",
     "metadata_index_path",
     "load_metadata_index",
     "discover",

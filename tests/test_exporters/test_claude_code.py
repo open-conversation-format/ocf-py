@@ -22,6 +22,9 @@ from ocf.exporters._manifest import load_manifest
 from ocf.exporters.claude_code import (
     AmbiguousMatchError,
     ClaudeCodeAdapter,
+    ClaudeCodeCliAdapter,
+    ClaudeCodeAppAdapter,
+    ClaudeCoworkAppAdapter,
     discover,
     export_all,
     export_one,
@@ -579,3 +582,151 @@ def test_ocf_filename_for_audit_jsonl_stable(tmp_path: Path) -> None:
     src.parent.mkdir(parents=True)
     src.touch()
     assert adapter.ocf_filename_for(src) == adapter.ocf_filename_for(src)
+
+
+# ---------------------------------------------------------------------------
+# Variant adapters: CLI / App / Cowork split
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def split_projects_dir(tmp_path: Path) -> Path:
+    """Three sessions in projects dir: two with metadata (App), one without (CLI)."""
+    root = tmp_path / ".claude" / "projects" / "home-user-proj"
+    root.mkdir(parents=True)
+    for uuid_stem in [
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",  # CLI-only
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",  # Desktop App
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",  # Desktop App
+    ]:
+        f = root / f"{uuid_stem}.jsonl"
+        with f.open("w", encoding="utf-8", newline="\n") as fh:
+            for ev in _claude_events():
+                fh.write(json.dumps(ev) + "\n")
+    return tmp_path / ".claude" / "projects"
+
+
+@pytest.fixture()
+def split_metadata_dir(tmp_path: Path) -> Path:
+    """Metadata entries for the two App sessions only (not the CLI one)."""
+    root = tmp_path / "Claude" / "claude-code-sessions" / "acc" / "org"
+    root.mkdir(parents=True)
+    for uuid_stem, title in [
+        ("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "App Session One"),
+        ("cccccccc-cccc-cccc-cccc-cccccccccccc", "App Session Two"),
+    ]:
+        meta = root / f"local_{uuid_stem}.json"
+        with meta.open("w", encoding="utf-8", newline="\n") as fh:
+            json.dump({"cliSessionId": uuid_stem, "title": title}, fh)
+    return tmp_path / "Claude" / "claude-code-sessions"
+
+
+@pytest.fixture()
+def split_cowork_dir(tmp_path: Path) -> Path:
+    """Agent-mode sessions directory with two agent sessions."""
+    root = (
+        tmp_path / "Claude" / "local-agent-mode-sessions"
+        / "acc" / "org" / "agent-uuid-1"
+        / ".claude" / "projects" / "sandbox-dir"
+    )
+    root.mkdir(parents=True)
+    for name in ["agent-abc123def.jsonl", "audit.jsonl"]:
+        f = root / name
+        with f.open("w", encoding="utf-8", newline="\n") as fh:
+            for ev in _claude_events():
+                fh.write(json.dumps(ev) + "\n")
+    return tmp_path / "Claude" / "local-agent-mode-sessions"
+
+
+def test_cli_adapter_excludes_app_sessions(
+    split_projects_dir: Path, split_metadata_dir: Path
+) -> None:
+    """CLI adapter discovers only sessions NOT in the metadata index."""
+    adapter = ClaudeCodeCliAdapter(metadata_dir_override=split_metadata_dir)
+    files = adapter.discover(split_projects_dir)
+    stems = {f.stem for f in files}
+    assert stems == {"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}
+
+
+def test_app_adapter_includes_only_app_sessions(
+    split_projects_dir: Path, split_metadata_dir: Path
+) -> None:
+    """App adapter discovers only sessions IN the metadata index."""
+    adapter = ClaudeCodeAppAdapter(metadata_dir_override=split_metadata_dir)
+    files = adapter.discover(split_projects_dir)
+    stems = {f.stem for f in files}
+    assert stems == {
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    }
+
+
+def test_cli_and_app_partition_complete(
+    split_projects_dir: Path, split_metadata_dir: Path
+) -> None:
+    """CLI + App adapters together cover all sessions — no overlap, no gaps."""
+    cli = ClaudeCodeCliAdapter(metadata_dir_override=split_metadata_dir)
+    app = ClaudeCodeAppAdapter(metadata_dir_override=split_metadata_dir)
+    cli_files = set(cli.discover(split_projects_dir))
+    app_files = set(app.discover(split_projects_dir))
+    # No overlap
+    assert cli_files & app_files == set()
+    # Complete partition
+    combined = ClaudeCodeAdapter(metadata_dir_override=split_metadata_dir)
+    # Combined scans projects dir only (not agent-mode) for this test
+    all_files = set(combined.discover(split_projects_dir))
+    assert cli_files | app_files == all_files
+
+
+def test_cowork_adapter_discovers_agent_sessions(
+    split_cowork_dir: Path,
+) -> None:
+    """Cowork adapter discovers sessions from agent-mode directory."""
+    adapter = ClaudeCoworkAppAdapter()
+    files = adapter.discover(split_cowork_dir)
+    names = {f.name for f in files}
+    assert names == {"agent-abc123def.jsonl", "audit.jsonl"}
+
+
+def test_cli_adapter_find_by_name_excludes_app(
+    split_projects_dir: Path, split_metadata_dir: Path
+) -> None:
+    """find_by_name on CLI adapter only returns CLI sessions."""
+    adapter = ClaudeCodeCliAdapter(metadata_dir_override=split_metadata_dir)
+    # The folder name contains "home-user-proj" so any query matching that
+    # would hit all sessions; but after filtering, only CLI sessions remain.
+    matches = adapter.find_by_name(
+        "home-user-proj", source_dirs=split_projects_dir
+    )
+    stems = {f.stem for f in matches}
+    assert stems == {"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}
+
+
+def test_app_adapter_export_one(
+    split_projects_dir: Path, split_metadata_dir: Path
+) -> None:
+    """App adapter export_one still works — shared conversion logic."""
+    adapter = ClaudeCodeAppAdapter(metadata_dir_override=split_metadata_dir)
+    files = adapter.discover(split_projects_dir)
+    assert len(files) >= 1
+    doc = adapter.export_one(files[0])
+    assert doc["ocf_version"] == "0.1.0"
+    assert doc["conversation"]["meta"]["claude_code"]["session_id"] == files[0].stem
+
+
+def test_cowork_adapter_export_one(split_cowork_dir: Path) -> None:
+    """Cowork adapter export_one works with agent-mode sessions."""
+    adapter = ClaudeCoworkAppAdapter()
+    files = adapter.discover(split_cowork_dir)
+    assert len(files) >= 1
+    doc = adapter.export_one(files[0])
+    assert doc["ocf_version"] == "0.1.0"
+
+
+def test_adapter_variant_names() -> None:
+    """Each adapter has a unique name for the tool registry."""
+    names = {
+        ClaudeCodeCliAdapter.name,
+        ClaudeCodeAppAdapter.name,
+        ClaudeCoworkAppAdapter.name,
+    }
+    assert names == {"claude_code_cli", "claude_code_app", "claude_cowork_app"}

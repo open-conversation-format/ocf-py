@@ -29,6 +29,7 @@ from ocf import __version__
 from ocf.core.schema import validate_strict
 from ocf.exporters._base import (
     AmbiguousMatchError,
+    SessionInfo,
     SourceAdapter,
     export_all as _export_all_generic,
 )
@@ -135,6 +136,52 @@ class CodexAdapter(SourceAdapter):
             source,
             session_index=self._resolve_index_for_source(Path(source)),
             validate=validate,
+        )
+
+    # ----- Session info (for ``ocf list``) ----------------------------------
+
+    def session_info(self, source: Path) -> SessionInfo:
+        """Peek session_meta + session_index for title, cwd, model."""
+        session_id, cwd, originator = _peek_session_meta(source)
+        title: str | None = None
+        model: str | None = None
+        created_at: datetime | None = None
+
+        if session_id:
+            index = self._resolve_index_for_source(source)
+            row = index.get(session_id)
+            if row:
+                tn = row.get("thread_name")
+                if isinstance(tn, str) and tn:
+                    title = tn
+                md = row.get("model")
+                if isinstance(md, str) and md:
+                    model = md
+
+        # Parse created_at from filename: rollout-<ISO>-<UUID>.jsonl
+        name = source.stem  # e.g. rollout-2026-04-26T10-00-00-<uuid>
+        if name.startswith("rollout-") and len(name) > 30:
+            ts_part = name[len("rollout-"):].rsplit("-", 5)[0]
+            # Approximate: replace the T-separator hyphens back
+            try:
+                created_at = datetime.fromisoformat(
+                    ts_part.replace("Z", "+00:00")
+                )
+            except ValueError:
+                pass
+
+        project: str | None = None
+        if cwd:
+            parts = _split_cwd(cwd)
+            project = parts[-1] if parts else cwd
+
+        return SessionInfo(
+            source=source,
+            session_id=session_id or source.stem,
+            title=title,
+            project=project,
+            created_at=created_at,
+            model=model,
         )
 
     # ----- Internal helpers -----------------------------------------------

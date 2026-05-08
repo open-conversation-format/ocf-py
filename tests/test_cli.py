@@ -61,20 +61,54 @@ def test_unknown_tool_rejected_by_argparse(capsys: pytest.CaptureFixture[str]) -
     assert "bogus_tool" in err or "invalid choice" in err.lower()
 
 
-def test_dash_alias_for_claude_code_accepted() -> None:
-    """``claude-code`` and ``claude_code`` should both dispatch."""
-    # We don't run a real export — just confirm the parser accepts the
-    # alias without raising. The discover/export side will be empty
-    # because we point at an empty dir.
+def test_claude_code_cli_tool_accepted() -> None:
+    """``claude-code-cli`` is a valid tool name."""
     rc = main(
         [
             "list",
-            "claude-code",
+            "claude-code-cli",
             "--source-dir",
             str(Path("/nonexistent-claude-dir-xxxx")),
         ]
     )
     assert rc == 0
+
+
+def test_claude_code_app_tool_accepted() -> None:
+    """``claude-code-app`` is a valid tool name."""
+    rc = main(
+        [
+            "list",
+            "claude-code-app",
+            "--source-dir",
+            str(Path("/nonexistent-claude-dir-xxxx")),
+        ]
+    )
+    assert rc == 0
+
+
+def test_claude_cowork_app_tool_accepted() -> None:
+    """``claude-cowork-app`` is a valid tool name."""
+    rc = main(
+        [
+            "list",
+            "claude-cowork-app",
+            "--source-dir",
+            str(Path("/nonexistent-claude-dir-xxxx")),
+        ]
+    )
+    assert rc == 0
+
+
+def test_old_claude_code_alias_rejected() -> None:
+    """``claude-code`` and ``claude_code`` are no longer valid tool names."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(["list", "claude-code"])
+    assert excinfo.value.code == 2
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["list", "claude_code"])
+    assert excinfo.value.code == 2
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +363,7 @@ def test_export_missing_source_dir_returns_two(
 # list
 # ---------------------------------------------------------------------------
 
-def test_list_codex_prints_discovered_files(
+def test_list_codex_prints_session_table(
     codex_sessions_dir: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -343,7 +377,28 @@ def test_list_codex_prints_discovered_files(
     )
     assert rc == 0
     captured = capsys.readouterr()
-    # File path goes to stdout, count to stderr
+    # Table header and at least one row
+    assert "ID" in captured.out
+    assert "Title" in captured.out
+    assert "total: 1" in captured.err
+
+
+def test_list_codex_paths_mode(
+    codex_sessions_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(
+        [
+            "list",
+            "codex",
+            "--source-dir",
+            str(codex_sessions_dir),
+            "--paths",
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    # Raw file path in stdout
     assert "rollout-" in captured.out
     assert "total: 1" in captured.err
 
