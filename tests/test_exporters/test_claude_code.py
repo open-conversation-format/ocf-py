@@ -93,7 +93,7 @@ def _claude_events() -> list[dict]:
         },
         {
             "type": "ai-title",
-            "title": "Write hello function",
+            "aiTitle": "Write hello function",
             "timestamp": "2026-04-26T10:00:13Z",
         },
     ]

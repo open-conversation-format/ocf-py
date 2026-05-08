@@ -260,9 +260,11 @@ class ClaudeCodeAdapter(SourceAdapter):
         Strategy:
         1. Desktop metadata index (in-memory, zero I/O) — gives title,
            cwd, model for App/Cowork sessions.
-        2. JSONL peek (first ~20 events) — gives cwd, model, created_at
-           from ``system`` event, and title from ``ai-title`` if it
-           appears early. CLI sessions rely on this.
+        2. JSONL peek (first ~10 events) — gives cwd, model, created_at.
+           In Claude Code JSONL, cwd lives on ``user``/``assistant``
+           events (not a separate ``system`` event), and model is in
+           ``ev["message"]["model"]``.  ``ai-title`` uses the key
+           ``aiTitle``.
         """
         session_id = source.stem
         index = self._resolve_metadata_index()
@@ -273,10 +275,8 @@ class ClaudeCodeAdapter(SourceAdapter):
         model = meta.get("model") if isinstance(meta.get("model"), str) else None
         created_at: datetime | None = None
 
-        # Peek the JSONL: first few events for system metadata (cwd,
-        # model, created_at), then a reverse scan of the tail for
-        # ai-title (which comes after the first assistant turn and
-        # can be at event 50+ in tool-heavy sessions).
+        # Peek the JSONL: first few events for metadata (cwd on user/
+        # assistant events, model in message.model, ai-title as aiTitle).
         try:
             for i, ev in enumerate(iter_jsonl_tailsafe(source)):
                 if i > 10:
@@ -290,9 +290,15 @@ class ClaudeCodeAdapter(SourceAdapter):
                         cwd = ev["cwd"]
                     if not model and isinstance(ev.get("model"), str):
                         model = ev["model"]
+                elif etype in (EVENT_USER, EVENT_ASSISTANT):
+                    if not cwd and isinstance(ev.get("cwd"), str):
+                        cwd = ev["cwd"]
+                    msg = ev.get("message") or {}
+                    if not model and isinstance(msg.get("model"), str):
+                        model = msg["model"]
                 elif etype == EVENT_AI_TITLE:
-                    if not title and isinstance(ev.get("title"), str):
-                        title = ev["title"]
+                    if not title and isinstance(ev.get("aiTitle"), str):
+                        title = ev["aiTitle"]
         except OSError:
             pass
 
@@ -623,7 +629,7 @@ def _convert_claude_code_session(
             continue  # system event is metadata, no OCF message
 
         if etype == EVENT_AI_TITLE:
-            t = ev.get("title")
+            t = ev.get("aiTitle")
             if isinstance(t, str) and t:
                 title = t
             continue
@@ -634,11 +640,18 @@ def _convert_claude_code_session(
             continue
 
         if etype == EVENT_USER:
+            # cwd lives on user events in most Claude Code JSONL
+            ev_cwd = ev.get("cwd")
+            if isinstance(ev_cwd, str) and ev_cwd and not cwd:
+                cwd = ev_cwd
             envelopes = _envelopes_from_user(ev, next_msg_id, ts)
             messages.extend(envelopes)
             continue
 
         if etype == EVENT_ASSISTANT:
+            ev_cwd = ev.get("cwd")
+            if isinstance(ev_cwd, str) and ev_cwd and not cwd:
+                cwd = ev_cwd
             envelopes = _envelopes_from_assistant(
                 ev, next_msg_id, ts, default_model
             )
@@ -987,7 +1000,7 @@ def _peek_ai_title_tail(path: Path, tail_bytes: int = 8192) -> str | None:
             except (json.JSONDecodeError, TypeError):
                 continue
             if ev.get("type") == EVENT_AI_TITLE:
-                t = ev.get("title")
+                t = ev.get("aiTitle")
                 if isinstance(t, str) and t:
                     return t
     except OSError:
