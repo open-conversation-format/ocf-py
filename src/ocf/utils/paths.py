@@ -11,12 +11,25 @@ Cross-platform handling:
 If a default cannot be determined for the current platform, the
 function returns the most likely path even if it does not exist;
 callers are expected to verify with :meth:`Path.exists` before use.
+
+MSIX packaging note (Windows)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The Claude Desktop App ships as an MSIX package.  Windows virtualises
+``%APPDATA%\\Claude\\`` for processes inside the container — they see
+it at the normal Roaming path.  External processes (user shells,
+standalone Python) see the real location under::
+
+    %LOCALAPPDATA%\\Packages\\Claude_<hash>\\LocalCache\\Roaming\\Claude\\
+
+:func:`_claude_desktop_data_dir` transparently resolves to whichever
+location actually exists.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -49,6 +62,39 @@ def codex_sessions_dir() -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Claude Desktop App — MSIX-aware data directory
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _claude_desktop_data_dir() -> Path:
+    """Resolve the Claude Desktop App's data directory.
+
+    1. ``%APPDATA%/Claude/`` — works inside the MSIX container
+       (i.e. when Claude Code runs as a child of the Desktop App).
+    2. ``%LOCALAPPDATA%/Packages/Claude_*/LocalCache/Roaming/Claude/``
+       — the real path that external processes (user shells) must use.
+    3. Falls back to ``%APPDATA%/Claude/`` even if it doesn't exist
+       (best-effort for non-Windows or unusual setups).
+    """
+    candidate = appdata() / "Claude"
+    if candidate.exists():
+        return candidate
+    if sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            packages = Path(local) / "Packages"
+            try:
+                for pkg in packages.iterdir():
+                    if pkg.name.lower().startswith("claude_") and pkg.is_dir():
+                        msix = pkg / "LocalCache" / "Roaming" / "Claude"
+                        if msix.exists():
+                            return msix
+            except OSError:
+                pass
+    return candidate  # fallback: original path even if missing
+
+
+# ---------------------------------------------------------------------------
 # Claude Code
 # ---------------------------------------------------------------------------
 
@@ -77,12 +123,10 @@ def claude_code_desktop_sessions_metadata_dir() -> Path:
     :func:`claude_code_projects_dir`; the metadata file maps via
     ``cliSessionId``.
 
-    Locations:
-        - Windows: ``%APPDATA%/Claude/claude-code-sessions/``
-        - macOS: ``~/Library/Application Support/Claude/claude-code-sessions/``
-        - Linux: ``~/.config/Claude/claude-code-sessions/``
+    Uses :func:`_claude_desktop_data_dir` to resolve MSIX virtualisation
+    on Windows (see module docstring).
     """
-    return appdata() / "Claude" / "claude-code-sessions"
+    return _claude_desktop_data_dir() / "claude-code-sessions"
 
 
 def claude_code_desktop_agent_mode_sessions_dir() -> Path:
@@ -94,8 +138,11 @@ def claude_code_desktop_agent_mode_sessions_dir() -> Path:
     Layout::
 
         <root>/<acc>/<org>/<agent-uuid>/.claude/projects/<encoded>/*.jsonl
+
+    Uses :func:`_claude_desktop_data_dir` to resolve MSIX virtualisation
+    on Windows (see module docstring).
     """
-    return appdata() / "Claude" / "local-agent-mode-sessions"
+    return _claude_desktop_data_dir() / "local-agent-mode-sessions"
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +181,7 @@ __all__ = [
     "claude_code_global_history",
     "claude_code_desktop_sessions_metadata_dir",
     "claude_code_desktop_agent_mode_sessions_dir",
+    "_claude_desktop_data_dir",
     "cursor_user_dir",
     "cursor_global_state_db",
     "cursor_workspace_storage_dir",
