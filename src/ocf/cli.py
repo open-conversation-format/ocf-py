@@ -568,11 +568,18 @@ def _cmd_render(args: argparse.Namespace) -> int:
         )
         return 2
     if has_tool and has_input:
-        print(
-            "error: --tool and positional input paths are mutually exclusive",
-            file=sys.stderr,
-        )
-        return 2
+        # Common UX: ``ocf render --tool X --source Y output.md``
+        # Treat a single positional as the output path, not as input.
+        if len(args.input) == 1:
+            args.out = args.input[0]
+            args.input = []
+            has_input = False
+        else:
+            print(
+                "error: --tool and positional input paths are mutually exclusive",
+                file=sys.stderr,
+            )
+            return 2
 
     renderer_cls = RENDERERS[args.format]
     # Only the Markdown renderer takes a simple flag today; pass it
@@ -666,11 +673,20 @@ def _render_from_tool(args: argparse.Namespace, renderer: Any) -> int:
     if not sources:
         print("no sessions found", file=sys.stderr)
         return 1
+
+    out_path_arg = Path(args.out)
+
+    # Single-file output: ``ocf render --tool X --source Y output.md``
+    # When the output path looks like a file (has an extension) and
+    # exactly one session is being rendered, write directly to that file
+    # instead of treating it as a directory.
+    single_file = out_path_arg.suffix and len(sources) == 1
+
+    if not single_file:
+        out_path_arg.mkdir(parents=True, exist_ok=True)
+
     if not args.quiet:
         print(f"rendering {len(sources)} session(s) from {args.tool}")
-
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     new_count = 0
     skip_count = 0
@@ -697,11 +713,15 @@ def _render_from_tool(args: argparse.Namespace, renderer: Any) -> int:
             fail_count += 1
             continue
 
-        ocf_name = adapter.ocf_filename_for(src)
-        out_name = renderer.output_filename_for(Path(ocf_name))
-        out_path = out_dir / out_name
+        if single_file:
+            out_path = out_path_arg
+        else:
+            ocf_name = adapter.ocf_filename_for(src)
+            out_name = renderer.output_filename_for(Path(ocf_name))
+            out_path = out_path_arg / out_name
 
         if not args.dry_run:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = out_path.with_suffix(out_path.suffix + ".tmp")
             tmp.write_text(rendered, encoding="utf-8")
             os.replace(tmp, out_path)
