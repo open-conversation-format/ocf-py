@@ -6,7 +6,7 @@ so any agent (or human) can search across all archived sessions.
 Document schema (per session)::
 
     {
-        "id":         "claude_code_cli__423b57f7",
+        "id":         "claude-code-cli__2026-04-26T14-30-00__423b57f7-a078-4e8c-8b41-c72a70ca4652",
         "session_id": "423b57f7-a078-4e8c-8b41-c72a70ca4652",
         "tool":       "claude-code-cli",
         "title":      "Research chat export formats",
@@ -17,8 +17,9 @@ Document schema (per session)::
         "content":    "# Research chat export formats\\n\\n..."
     }
 
-The ``id`` field combines tool + session stem to avoid collisions
-across adapters (a UUID can appear in both CLI and App).
+The ``id`` encodes tool, datetime, and session UUID so a human can
+read all three at a glance. Collisions across adapters are avoided
+because the tool prefix differs even when UUIDs overlap.
 
 All write operations are upserts - re-indexing a session that already
 exists just replaces it. This makes the indexer fully idempotent.
@@ -102,6 +103,7 @@ def _make_document(
     created_at_str = conv.get("created_at")
     created_ts: int = 0
     created_date: str = ""
+    created_datetime: str = ""
     if created_at_str:
         try:
             dt = datetime.fromisoformat(
@@ -109,12 +111,15 @@ def _make_document(
             )
             created_ts = int(dt.timestamp())
             created_date = dt.strftime("%Y-%m-%d")
+            created_datetime = dt.strftime("%Y-%m-%dT%H-%M-%S")
         except (ValueError, OSError):
             pass
 
-    # Build a stable document ID from tool + session.
+    # Build a human-readable document ID: <tool>__<datetime>__<session_id>
     # Meilisearch IDs allow only alphanumeric, hyphens, underscores.
-    clean_id = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{tool_name}__{session_id}")
+    dt_part = f"__{created_datetime}" if created_datetime else ""
+    raw_id = f"{tool_name}{dt_part}__{session_id}"
+    clean_id = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_id)
 
     return {
         "id": clean_id,

@@ -78,6 +78,67 @@ BUBBLE_TEXT_FIELDS = ("text", "rawText")
 BUBBLE_THINKING_FIELD = "thinking"
 BUBBLE_CODE_BLOCKS_FIELD = "codeBlocks"
 
+# Lazy workspace map: composer_id -> workspace folder path
+_workspace_map: dict[str, str] | None = None
+
+
+def _get_workspace_map() -> dict[str, str]:
+    """Build (or return cached) composer_id -> workspace folder mapping.
+
+    Cursor stores a per-workspace session index in each
+    ``workspaceStorage/<hash>/state.vscdb`` under the ItemTable key
+    ``composer.composerData``.  That JSON blob has an ``allComposers``
+    list with ``composerId`` entries.  The sibling ``workspace.json``
+    maps the hash back to the real folder path.
+    """
+    global _workspace_map
+    if _workspace_map is not None:
+        return _workspace_map
+
+    from urllib.parse import unquote
+
+    _workspace_map = {}
+    ws_dir = cursor_user_dir() / "workspaceStorage"
+    if not ws_dir.is_dir():
+        return _workspace_map
+
+    for entry in ws_dir.iterdir():
+        ws_json = entry / "workspace.json"
+        ws_db = entry / "state.vscdb"
+        if not ws_json.is_file() or not ws_db.is_file():
+            continue
+        try:
+            ws_data = json.loads(ws_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        folder_uri = ws_data.get("folder") or ws_data.get("workspace") or ""
+        folder = unquote(folder_uri.replace("file:///", ""))
+        if len(folder) > 1 and folder[1] == ":":
+            folder = folder[0].upper() + folder[1:]
+        if not folder:
+            continue
+
+        try:
+            with open_ro(ws_db) as conn:
+                if not has_table(conn, "ItemTable"):
+                    continue
+                row = conn.execute(
+                    "SELECT value FROM ItemTable "
+                    "WHERE key = 'composer.composerData'"
+                ).fetchone()
+                if not (row and row["value"]):
+                    continue
+                data = json.loads(row["value"])
+                for c in data.get("allComposers", []):
+                    if isinstance(c, dict):
+                        cid = c.get("composerId")
+                        if cid:
+                            _workspace_map[cid] = folder
+        except (sqlite3.Error, json.JSONDecodeError, OSError):
+            continue
+
+    return _workspace_map
+
 
 def _make_source_token(db_path: Path, composer_id: str) -> Path:
     """Encode (db, composer_id) as a Path-like token."""
@@ -492,13 +553,20 @@ def _convert_cursor_session(
         if isinstance(v, str) and v:
             title = v
     default_model = lcs.get("model") if isinstance(lcs, dict) else None
-    # Fallback: also check 'modelId' or 'model' on composer itself
+    # Fallback: check 'modelId' or 'model' on composer itself
     if not default_model:
         for key in ("model", "modelId", "modelName"):
             v = composer.get(key)
             if isinstance(v, str) and v:
                 default_model = v
                 break
+    # Fallback: modelConfig.modelName (current Cursor versions)
+    if not default_model:
+        mc = composer.get("modelConfig")
+        if isinstance(mc, dict):
+            v = mc.get("modelName")
+            if isinstance(v, str) and v:
+                default_model = v
 
     started_at: datetime | None = _parse_ts(composer.get("createdAt"))
     ended_at: datetime | None = started_at
@@ -558,12 +626,17 @@ def _convert_cursor_session(
     }
     if ended_at is not None:
         conversation["updated_at"] = _format_iso(ended_at)
-    if workspace_folder:
+    # Derive workspace from explicit field or from file paths in context
+    effective_workspace = (
+        workspace_folder
+        or _get_workspace_map().get(composer_id)
+    )
+    if effective_workspace:
         conversation["project"] = {
-            "id": _project_id(workspace_folder),
-            "name": _project_name(workspace_folder),
+            "id": _project_id(effective_workspace),
+            "name": _project_name(effective_workspace),
             "platform_id": None,
-            "description": workspace_folder,
+            "description": effective_workspace,
         }
 
     doc: dict[str, Any] = {
@@ -877,13 +950,19 @@ def _hash_short(value: str, length: int = 12) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 
 
+
 def _project_id(workspace_folder: str) -> str:
     return f"proj_{_hash_short(workspace_folder, 12)}"
 
 
 def _project_name(workspace_folder: str) -> str:
     parts = _split_path(workspace_folder)
-    return parts[-1] if parts else workspace_folder
+    name = parts[-1] if parts else workspace_folder
+    # Strip VS Code workspace file extension if the URI pointed at a
+    # .code-workspace file rather than a plain folder.
+    if name.endswith(".code-workspace"):
+        name = name[: -len(".code-workspace")]
+    return name
 
 
 __all__ = [
