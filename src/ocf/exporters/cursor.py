@@ -85,22 +85,39 @@ _workspace_map: dict[str, str] | None = None
 def _get_workspace_map() -> dict[str, str]:
     """Build (or return cached) composer_id -> workspace folder mapping.
 
-    Cursor stores a per-workspace session index in each
-    ``workspaceStorage/<hash>/state.vscdb`` under the ItemTable key
-    ``composer.composerData``.  That JSON blob has an ``allComposers``
-    list with ``composerId`` entries.  The sibling ``workspace.json``
-    maps the hash back to the real folder path.
+    Cursor uses two storage generations for workspace -> composer
+    mapping, both in ``workspaceStorage/<hash>/state.vscdb``:
+
+    **Old format** (pre ~March 2026):
+        ``composer.composerData`` in ItemTable contains
+        ``{"allComposers": [{"composerId": "...", ...}, ...]}``
+
+    **New format** (current):
+        ``composer.composerData`` contains
+        ``{"selectedComposerIds": [...], ...}`` (only active tabs).
+        All historical composer IDs live in
+        ``workbench.panel.composerChatViewPane.<uuid>`` entries
+        whose values reference ``workbench.panel.aichat.view.<cid>``.
+
+    The sibling ``workspace.json`` maps the hash back to the real
+    folder path.  We merge both sources for full coverage.
     """
     global _workspace_map
     if _workspace_map is not None:
         return _workspace_map
 
+    import re
     from urllib.parse import unquote
 
     _workspace_map = {}
     ws_dir = cursor_user_dir() / "workspaceStorage"
     if not ws_dir.is_dir():
         return _workspace_map
+
+    _uuid_re = re.compile(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        re.IGNORECASE,
+    )
 
     for entry in ws_dir.iterdir():
         ws_json = entry / "workspace.json"
@@ -122,19 +139,50 @@ def _get_workspace_map() -> dict[str, str]:
             with open_ro(ws_db) as conn:
                 if not has_table(conn, "ItemTable"):
                     continue
+
+                # --- Old format: allComposers ---
                 row = conn.execute(
                     "SELECT value FROM ItemTable "
                     "WHERE key = 'composer.composerData'"
                 ).fetchone()
-                if not (row and row["value"]):
-                    continue
-                data = json.loads(row["value"])
-                for c in data.get("allComposers", []):
-                    if isinstance(c, dict):
-                        cid = c.get("composerId")
-                        if cid:
+                if row and row["value"]:
+                    try:
+                        data = json.loads(row["value"])
+                    except json.JSONDecodeError:
+                        data = {}
+                    for c in data.get("allComposers", []):
+                        if isinstance(c, dict):
+                            cid = c.get("composerId")
+                            if cid:
+                                _workspace_map[cid] = folder
+                    # New format: selectedComposerIds
+                    for cid in data.get("selectedComposerIds", []):
+                        if isinstance(cid, str) and cid:
                             _workspace_map[cid] = folder
-        except (sqlite3.Error, json.JSONDecodeError, OSError):
+
+                # --- New format: viewPane refs ---
+                # Keys like workbench.panel.composerChatViewPane.<pane-uuid>
+                # have values referencing aichat.view.<composer-uuid>.
+                for pane_row in conn.execute(
+                    "SELECT value FROM ItemTable "
+                    "WHERE key LIKE "
+                    "'workbench.panel.composerChatViewPane.%'"
+                ):
+                    if not pane_row["value"]:
+                        continue
+                    try:
+                        pane = json.loads(pane_row["value"])
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(pane, dict):
+                        continue
+                    for vkey in pane:
+                        # "workbench.panel.aichat.view.<UUID>"
+                        m = _uuid_re.search(vkey)
+                        if m:
+                            _workspace_map[m.group(0)] = folder
+
+        except (sqlite3.Error, OSError):
             continue
 
     return _workspace_map
