@@ -27,6 +27,7 @@ exists just replaces it. This makes the indexer fully idempotent.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -91,11 +92,12 @@ def _make_document(
         except (ValueError, OSError):
             pass
 
-    # Build a stable document ID from tool + session
-    doc_id = f"{tool_name}__{session_id}".replace("-", "_")
+    # Build a stable document ID from tool + session.
+    # Meilisearch IDs allow only alphanumeric, hyphens, underscores.
+    clean_id = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{tool_name}__{session_id}")
 
     return {
-        "id": doc_id,
+        "id": clean_id,
         "session_id": session_id,
         "tool": tool_name,
         "title": conv.get("title") or "",
@@ -109,14 +111,16 @@ def _make_document(
 
 def _extract_project(conv: dict[str, Any]) -> str:
     """Best-effort project name from conversation metadata."""
-    # Direct project field
     project = conv.get("project")
+    if isinstance(project, dict):
+        name = project.get("name")
+        if isinstance(name, str) and name:
+            return name
     if isinstance(project, str) and project:
         return project
-    # From source.cwd - take last path component
+    # Fallback: source.cwd last path component
     cwd = (conv.get("source") or {}).get("cwd")
     if isinstance(cwd, str) and cwd:
-        # Take last meaningful path segment
         parts = cwd.replace("\\", "/").rstrip("/").split("/")
         return parts[-1] if parts else ""
     return ""
