@@ -881,13 +881,14 @@ def _index_all_tools(
     from ocf.indexers.meilisearch import IndexResult, _make_document, index_documents
 
     result = IndexResult()
-    documents: list[dict[str, Any]] = []
 
     for tool_name, tool in tools.items():
         try:
             sources = tool.discover()
         except Exception:
             continue
+
+        tool_docs: list[dict[str, Any]] = []
 
         for src in sources:
             src_key = str(src)
@@ -931,7 +932,7 @@ def _index_all_tools(
                 continue
 
             meili_doc = _make_document(doc, tool_name, rendered)
-            documents.append(meili_doc)
+            tool_docs.append(meili_doc)
 
             # Track state for delta detection
             if known_state is not None:
@@ -945,14 +946,17 @@ def _index_all_tools(
                 title = meili_doc.get("title") or meili_doc["session_id"][:8]
                 print(f"  index  {tool_name}: {title}")
 
-    # Batch push
-    if documents:
-        try:
-            index_documents(index, documents, client=client)
-            result.indexed = len(documents)
-        except Exception as exc:
-            print(f"error: Meilisearch push failed: {exc}", file=sys.stderr)
-            result.failed += len(documents)
+        # Push per tool so one bad document doesn't kill the whole batch
+        if tool_docs:
+            try:
+                index_documents(index, tool_docs, client=client)
+                result.indexed += len(tool_docs)
+            except Exception as exc:
+                print(
+                    f"error: push failed for {tool_name}: {exc}",
+                    file=sys.stderr,
+                )
+                result.failed += len(tool_docs)
 
     return result
 
