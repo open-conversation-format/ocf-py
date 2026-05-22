@@ -155,6 +155,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_list(args)
         if args.command == "render":
             return _cmd_render(args)
+        if args.command == "index":
+            return _cmd_index(args)
         if args.command == "watch":
             return _cmd_watch(args)
     except FileNotFoundError as exc:
@@ -406,6 +408,63 @@ def _build_parser() -> argparse.ArgumentParser:
             "thinking blocks. Optimized for human reading rather "
             "than indexing."
         ),
+    )
+
+    # ---- index --------------------------------------------------------
+    p_index = sub.add_parser(
+        "index",
+        help="Index sessions into Meilisearch for full-text search.",
+        description=(
+            "Push sessions from one or all tools into a Meilisearch index.\n\n"
+            "  One-shot:  ocf index --url http://localhost:7700\n"
+            "  Watch:     ocf index --url http://localhost:7700 --watch\n"
+            "  One tool:  ocf index --url http://localhost:7700 --tool claude-code-app\n\n"
+            "Sessions are exported to OCF, rendered to Markdown, and pushed\n"
+            "as searchable documents with filterable facets (tool, project,\n"
+            "model, date). Re-indexing is idempotent (upsert by session ID)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_index.add_argument(
+        "--url",
+        default="http://localhost:7700",
+        help="Meilisearch URL (default: http://localhost:7700).",
+    )
+    p_index.add_argument(
+        "--key",
+        default=None,
+        help="Meilisearch API key (or set MEILI_MASTER_KEY env var).",
+    )
+    p_index.add_argument(
+        "--index-name",
+        dest="index_name",
+        default="ocf-sessions",
+        help="Meilisearch index name (default: ocf-sessions).",
+    )
+    p_index.add_argument(
+        "--tool",
+        choices=_TOOL_CHOICES,
+        default=None,
+        help=(
+            "Index only this tool. Without this flag, all tools are indexed."
+        ),
+    )
+    p_index.add_argument(
+        "--watch",
+        action="store_true",
+        help="Keep running and re-index changed sessions every --interval seconds.",
+    )
+    p_index.add_argument(
+        "--interval",
+        type=float,
+        default=30.0,
+        help="Poll interval in seconds for --watch mode (default: 30).",
+    )
+    p_index.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Suppress per-session lines; print only summaries.",
     )
 
     # ---- watch --------------------------------------------------------
@@ -736,6 +795,166 @@ def _render_from_tool(args: argparse.Namespace, renderer: Any) -> int:
         f"{fail_count} failed"
     )
     return 1 if fail_count else 0
+
+
+def _cmd_index(args: argparse.Namespace) -> int:
+    """Index sessions into Meilisearch."""
+    import os
+    import time
+
+    try:
+        import meilisearch
+    except ImportError:
+        print(
+            "error: meilisearch package not installed.\n"
+            "  pip install meilisearch",
+            file=sys.stderr,
+        )
+        return 2
+
+    from ocf.indexers.meilisearch import (
+        DEFAULT_INDEX,
+        IndexResult,
+        _make_document,
+        ensure_index,
+        index_documents,
+    )
+    from ocf.renderers.markdown import MarkdownRenderer
+
+    # Connect
+    api_key = args.key or os.environ.get("MEILI_MASTER_KEY") or ""
+    try:
+        client = meilisearch.Client(args.url, api_key)
+        client.health()
+    except Exception as exc:
+        print(f"error: cannot connect to Meilisearch at {args.url}: {exc}", file=sys.stderr)
+        return 2
+
+    index_name = args.index_name or DEFAULT_INDEX
+    index = ensure_index(client, index_name)
+    renderer = MarkdownRenderer(simple=True)
+
+    # Which tools to index
+    if args.tool:
+        tools = {args.tool: _TOOLS[args.tool]}
+    else:
+        tools = _TOOLS
+
+    if args.watch:
+        print(f"watching for changes every {args.interval}s (Ctrl+C to stop)")
+        print(f"index: {args.url}/indexes/{index_name}")
+        # Track mtime+size per source for delta detection
+        known: dict[str, tuple[float, int]] = {}
+        while True:
+            result = _index_all_tools(
+                tools, index, client, renderer, args, known_state=known
+            )
+            if result.indexed > 0 and not args.quiet:
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] "
+                    f"+{result.indexed} indexed, "
+                    f"{result.skipped} unchanged, "
+                    f"{result.failed} failed"
+                )
+            time.sleep(args.interval)
+    else:
+        print(f"indexing into {args.url}/indexes/{index_name}")
+        result = _index_all_tools(tools, index, client, renderer, args)
+        print(
+            f"{result.indexed} indexed, "
+            f"{result.skipped} skipped, "
+            f"{result.failed} failed"
+        )
+        return 1 if result.failed else 0
+
+
+def _index_all_tools(
+    tools: dict[str, _AdapterShim],
+    index: Any,
+    client: Any,
+    renderer: Any,
+    args: Any,
+    *,
+    known_state: dict[str, tuple[float, int]] | None = None,
+) -> Any:
+    """Run one indexing pass across all selected tools."""
+    from ocf.indexers.meilisearch import IndexResult, _make_document, index_documents
+
+    result = IndexResult()
+    documents: list[dict[str, Any]] = []
+
+    for tool_name, tool in tools.items():
+        try:
+            sources = tool.discover()
+        except Exception:
+            continue
+
+        for src in sources:
+            src_key = str(src)
+
+            # Delta detection: skip unchanged files
+            if known_state is not None:
+                try:
+                    st = src.stat()
+                    current = (st.st_mtime, st.st_size)
+                except OSError:
+                    result.failed += 1
+                    continue
+                if known_state.get(src_key) == current:
+                    result.skipped += 1
+                    continue
+
+            # Export + render + build document
+            try:
+                doc = tool.adapter.export_one(src, validate=False)
+            except SkipExport:
+                result.skipped += 1
+                if known_state is not None:
+                    try:
+                        st = src.stat()
+                        known_state[src_key] = (st.st_mtime, st.st_size)
+                    except OSError:
+                        pass
+                continue
+            except Exception as exc:
+                if not args.quiet:
+                    print(f"FAILED   {src.name}: {exc}", file=sys.stderr)
+                result.failed += 1
+                continue
+
+            try:
+                rendered = renderer.render(doc)
+            except Exception as exc:
+                if not args.quiet:
+                    print(f"FAILED   {src.name} (render): {exc}", file=sys.stderr)
+                result.failed += 1
+                continue
+
+            meili_doc = _make_document(doc, tool_name, rendered)
+            documents.append(meili_doc)
+
+            # Track state for delta detection
+            if known_state is not None:
+                try:
+                    st = src.stat()
+                    known_state[src_key] = (st.st_mtime, st.st_size)
+                except OSError:
+                    pass
+
+            if not args.quiet:
+                title = meili_doc.get("title") or meili_doc["session_id"][:8]
+                print(f"  index  {tool_name}: {title}")
+
+    # Batch push
+    if documents:
+        try:
+            index_documents(index, documents, client=client)
+            result.indexed = len(documents)
+        except Exception as exc:
+            print(f"error: Meilisearch push failed: {exc}", file=sys.stderr)
+            result.failed += len(documents)
+
+    return result
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:
