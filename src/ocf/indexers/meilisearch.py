@@ -60,6 +60,35 @@ class IndexResult:
     failed: int = 0
 
 
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+
+def _extract_session_id(conv: dict[str, Any]) -> str:
+    """Pull a clean session ID from the OCF conversation.
+
+    Prefers the first UUID found in ``source.original_id`` or
+    ``conversation.id``. Falls back to the raw value stripped of
+    common prefixes and file extensions.
+    """
+    raw = (conv.get("source") or {}).get("original_id") or conv.get("id") or "unknown"
+    # Best case: extract a UUID
+    m = _UUID_RE.search(raw)
+    if m:
+        return m.group(0)
+    # Fallback: strip known noise
+    sid = raw
+    for prefix in ("conv_", "conv_claude_code_", "conv_codex_", "conv_cursor_"):
+        if sid.startswith(prefix):
+            sid = sid[len(prefix):]
+            break
+    # Strip file extension (.jsonl, .json)
+    sid = re.sub(r"\.(jsonl|json)$", "", sid)
+    return sid
+
+
 def _make_document(
     doc: dict[str, Any],
     tool_name: str,
@@ -67,17 +96,8 @@ def _make_document(
 ) -> dict[str, Any]:
     """Build a Meilisearch document from an OCF document + rendered text."""
     conv = doc.get("conversation", {})
-    source = conv.get("source", {})
 
-    session_id = source.get("original_id", conv.get("id", "unknown"))
-    # Strip the conv_ prefix if present
-    if session_id.startswith("conv_"):
-        session_id = session_id[5:]
-    # Strip platform prefix (e.g. "claude_code_" or "codex_")
-    for prefix in ("claude_code_", "codex_", "cursor_"):
-        if session_id.startswith(prefix):
-            session_id = session_id[len(prefix):]
-            break
+    session_id = _extract_session_id(conv)
 
     created_at_str = conv.get("created_at")
     created_ts: int = 0
