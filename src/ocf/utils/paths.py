@@ -149,18 +149,59 @@ def claude_code_desktop_agent_mode_sessions_dir() -> Path:
 # Cursor
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=1)
 def cursor_user_dir() -> Path:
     """Default Cursor User directory.
 
-    - Windows: ``%APPDATA%/Cursor/User/``
-    - macOS: ``~/Library/Application Support/Cursor/User/``
-    - Linux: ``~/.config/Cursor/User/``
+    Probes the platform-specific candidates in order and returns the
+    first one that actually exists. Falls back to the primary
+    platform default if nothing is found (so callers can still get a
+    deterministic path for error messages).
+
+    Probed locations:
+
+    - **Windows**: ``%APPDATA%/Cursor/User/``
+    - **macOS**: ``~/Library/Application Support/Cursor/User/``
+    - **Linux native**: ``~/.config/Cursor/User/`` (or ``$XDG_CONFIG_HOME``)
+    - **Linux Remote / SSH** (``cursor-server``): ``~/.cursor-server/data/User/``
+    - **WSL2 reading Windows-native Cursor**:
+      ``/mnt/c/Users/<u>/AppData/Roaming/Cursor/User/`` — discovered by
+      scanning ``/mnt/c/Users/*`` so the Windows username doesn't
+      need to be known.
+
+    Matches the locations listed by ``cursor-chat-browser`` so users
+    on Remote-SSH / WSL setups get sessions discovered automatically
+    without passing ``--source-dir``.
     """
+    candidates: list[Path] = []
+
     if sys.platform.startswith("win"):
-        return appdata() / "Cursor" / "User"
-    if sys.platform == "darwin":
-        return appdata() / "Cursor" / "User"
-    return appdata() / "Cursor" / "User"
+        candidates.append(appdata() / "Cursor" / "User")
+    elif sys.platform == "darwin":
+        candidates.append(
+            home() / "Library" / "Application Support" / "Cursor" / "User"
+        )
+    else:
+        # Linux family: native config, cursor-server (Remote/SSH), WSL2
+        candidates.append(appdata() / "Cursor" / "User")
+        candidates.append(home() / ".cursor-server" / "data" / "User")
+        mnt_c_users = Path("/mnt/c/Users")
+        if mnt_c_users.is_dir():
+            try:
+                for user_dir in mnt_c_users.iterdir():
+                    p = user_dir / "AppData" / "Roaming" / "Cursor" / "User"
+                    if p.is_dir():
+                        candidates.append(p)
+            except OSError:
+                pass
+
+    for c in candidates:
+        try:
+            if c.is_dir():
+                return c
+        except OSError:
+            continue
+    return candidates[0]
 
 
 def cursor_global_state_db() -> Path:
