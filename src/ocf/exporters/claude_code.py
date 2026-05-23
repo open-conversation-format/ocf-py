@@ -224,7 +224,13 @@ def load_cowork_metadata_index(
         except OSError:
             jsonls = []
         for jsonl in jsonls:
-            if jsonl.name == "audit.jsonl":
+            # audit.jsonl is the HMAC duplicate trail (not a session).
+            # agent-*.jsonl are sub-agents spawned WITHIN the worktree;
+            # they have their own context and must NOT inherit the
+            # parent session's sidecar title/model, or every sub-agent
+            # row in `ocf list` ends up labelled with the parent's
+            # ai-title.
+            if jsonl.name == "audit.jsonl" or jsonl.name.startswith("agent-"):
                 continue
             index.setdefault(jsonl.stem, row)
     return index
