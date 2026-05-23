@@ -290,6 +290,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Filter to sessions matching this UUID or fuzzy title.",
     )
+    p_list.add_argument(
+        "--all",
+        dest="show_all",
+        action="store_true",
+        help=(
+            "Include empty (ghost) sessions in the output. By default "
+            "they are hidden — they exist as composer rows but have no "
+            "messages and would be skipped on export."
+        ),
+    )
 
     # ---- render -------------------------------------------------------
     render_format_choices = sorted(set(RENDERERS))
@@ -562,14 +572,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
     else:
         sources = tool.discover(source_dir=source_dir)
 
-    if args.paths:
-        # Raw mode: one path per line (pipe-friendly, backward compat)
-        for s in sources:
-            print(s)
-        print(f"total: {len(sources)}", file=sys.stderr)
-        return 0
-
-    # Collect session metadata for a human-readable table
+    # Resolve session_info once — needed for both --paths (ghost filter)
+    # and the table view. Adapters that don't fill is_empty just leave
+    # it False, so the default-hide behavior is a no-op there.
     adapter = tool.adapter
     infos: list[SessionInfo] = []
     for s in sources:
@@ -578,8 +583,27 @@ def _cmd_list(args: argparse.Namespace) -> int:
         except Exception:
             infos.append(SessionInfo(source=s, session_id=s.stem))
 
-    _print_session_table(infos)
-    print(f"total: {len(infos)}", file=sys.stderr)
+    total = len(infos)
+    ghost = sum(1 for i in infos if i.is_empty)
+    real = total - ghost
+
+    visible = infos if args.show_all else [i for i in infos if not i.is_empty]
+    # Oldest first → newest at the bottom, so the most recent session
+    # is what you see right above the summary footer. Sessions without
+    # a created_at fall to the top (datetime.min sort key).
+    from datetime import datetime, timezone
+    _epoch_min = datetime.min.replace(tzinfo=timezone.utc)
+    visible.sort(key=lambda i: i.created_at or _epoch_min)
+
+    if args.paths:
+        for info in visible:
+            print(info.source)
+    else:
+        _print_session_table(visible)
+
+    print(f"total: {total}", file=sys.stderr)
+    print(f"ghost: {ghost}", file=sys.stderr)
+    print(f"real:  {real}", file=sys.stderr)
     return 0
 
 

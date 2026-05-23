@@ -274,6 +274,7 @@ class ClaudeCodeAdapter(SourceAdapter):
         cwd = meta.get("cwd") if isinstance(meta.get("cwd"), str) else None
         model = meta.get("model") if isinstance(meta.get("model"), str) else None
         created_at: datetime | None = None
+        first_user_text: str | None = None
 
         # Peek the JSONL: first few events for metadata (cwd on user/
         # assistant events, model in message.model, ai-title as aiTitle).
@@ -296,6 +297,12 @@ class ClaudeCodeAdapter(SourceAdapter):
                     msg = ev.get("message") or {}
                     if not model and isinstance(msg.get("model"), str):
                         model = msg["model"]
+                    if (
+                        etype == EVENT_USER
+                        and first_user_text is None
+                        and isinstance(msg, dict)
+                    ):
+                        first_user_text = _extract_user_text(msg)
                 elif etype == EVENT_AI_TITLE:
                     if not title and isinstance(ev.get("aiTitle"), str):
                         title = ev["aiTitle"]
@@ -305,6 +312,15 @@ class ClaudeCodeAdapter(SourceAdapter):
         # Reverse-peek for ai-title if we didn't find one yet
         if not title:
             title = _peek_ai_title_tail(source)
+
+        # Last resort: synthesize a title from the first user prompt.
+        # Claude Code only writes ``ai-title`` events asynchronously and
+        # sub-agent sessions skip them entirely — so without this
+        # fallback most ``ocf list`` rows for sub-agents and aborted
+        # sessions stay titleless. The prompt itself usually conveys
+        # the intent.
+        if not title and first_user_text:
+            title = _title_from_user_text(first_user_text)
 
         return SessionInfo(
             source=source,
@@ -1006,6 +1022,48 @@ def _peek_ai_title_tail(path: Path, tail_bytes: int = 8192) -> str | None:
     except OSError:
         pass
     return None
+
+
+def _extract_user_text(msg: dict[str, Any]) -> str | None:
+    """Pull plain text out of a Claude Code ``user`` message.
+
+    Content can be either a raw string or a list of typed blocks
+    (``[{"type": "text", "text": "..."}, ...]``). For sub-agent
+    resumes the first user event is often a ``tool_result`` block
+    with no text — those return ``None`` so the caller falls through
+    to the next event.
+    """
+    content = msg.get("content")
+    if isinstance(content, str):
+        text = content.strip()
+        return text or None
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == CB_TEXT:
+                raw = block.get("text") or ""
+                if isinstance(raw, str):
+                    text = raw.strip()
+                    if text:
+                        return text
+    return None
+
+
+def _title_from_user_text(text: str, max_len: int = 70) -> str:
+    """Shape a free-form user prompt into a list-friendly title.
+
+    Takes the first non-empty line, collapses internal whitespace,
+    and caps at ``max_len`` with an ellipsis. The table renderer
+    truncates further to its column width anyway; ``max_len`` mostly
+    keeps the metadata index reasonable in size.
+    """
+    first_line = next(
+        (ln.strip() for ln in text.splitlines() if ln.strip()),
+        "",
+    )
+    collapsed = " ".join(first_line.split())
+    if len(collapsed) > max_len:
+        return collapsed[: max_len - 1].rstrip() + "…"
+    return collapsed
 
 
 def _peek_cwd(path: Path) -> str | None:

@@ -63,6 +63,14 @@ class SessionInfo:
     project: str | None = None
     created_at: datetime | None = None
     model: str | None = None
+    is_empty: bool = False
+    """True if the source exists but contains no exportable messages.
+
+    These are the same sources :meth:`SourceAdapter.export_one` would
+    raise :class:`SkipExport` on (Cursor ghost composers, Claude Code
+    heartbeats). Surfaced here so the ``ocf list`` UI can filter or
+    count them without paying the full export cost.
+    """
 
 
 class AmbiguousMatchError(LookupError):

@@ -345,15 +345,24 @@ class CursorAdapter(SourceAdapter):
     # ----- Session info (for ``ocf list``) ----------------------------------
 
     def session_info(self, source: Path) -> SessionInfo:
-        """Peek composerData for title, workspace folder, and createdAt."""
+        """Peek composerData for title, workspace, model, and ghost status.
+
+        Mirrors the export-path fallback chains so ``ocf list cursor``
+        shows the same project / model values that ``ocf export`` would
+        write to the OCF document — minus the per-bubble model scan,
+        which would mean opening every bubble row just to populate the
+        list view. Composer-level model fields catch most cases anyway.
+        """
         try:
             db_path, composer_id = _split_source_token(source)
         except ValueError:
             return SessionInfo(source=source, session_id=source.stem)
 
         title: str | None = None
-        project: str | None = None
+        workspace_folder: str | None = None
+        model: str | None = None
         created_at: datetime | None = None
+        is_empty = False
 
         try:
             with open_ro(db_path) as conn:
@@ -370,17 +379,62 @@ class CursorAdapter(SourceAdapter):
                     )
                     if not isinstance(title, str):
                         title = None
+
                     wf = cdata.get("workspaceFolder")
                     if isinstance(wf, str) and wf:
-                        parts = _split_path(wf)
-                        project = parts[-1] if parts else wf
+                        workspace_folder = wf
+
+                    # Model fallback chain (matches _to_ocf_conversation
+                    # except for the per-bubble modelInfo scan, which
+                    # would defeat the cheap-peek design of list).
+                    lcs = cdata.get("latestConversationSummary") or {}
+                    if isinstance(lcs, dict):
+                        v = lcs.get("model")
+                        if isinstance(v, str) and v:
+                            model = v
+                    if not model:
+                        for key in ("model", "modelId", "modelName"):
+                            v = cdata.get(key)
+                            if isinstance(v, str) and v:
+                                model = v
+                                break
+                    if not model:
+                        mc = cdata.get("modelConfig")
+                        if isinstance(mc, dict):
+                            v = mc.get("modelName")
+                            if isinstance(v, str) and v:
+                                model = v
+
                     ca = cdata.get("createdAt")
                     if isinstance(ca, (int, float)):
                         created_at = datetime.fromtimestamp(
                             ca / 1000, tz=timezone.utc
                         )
+
+                # Workspace fallbacks beyond composerData.workspaceFolder
+                if not workspace_folder:
+                    workspace_folder = _get_workspace_map().get(composer_id)
+                if not workspace_folder:
+                    workspace_folder = _workspace_from_request_context(
+                        conn, composer_id
+                    )
+
+                # Ghost detection — does this composer have any bubbles?
+                # LIMIT 1 keeps it O(1) rather than scanning every row.
+                bubble = conn.execute(
+                    "SELECT 1 FROM cursorDiskKV "
+                    "WHERE key LIKE ? AND value IS NOT NULL LIMIT 1",
+                    (f"{BUBBLE_KEY_PREFIX}{composer_id}:%",),
+                ).fetchone()
+                if not bubble:
+                    is_empty = True
+
         except (sqlite3.Error, json.JSONDecodeError, TypeError):
             pass
+
+        project: str | None = None
+        if workspace_folder:
+            project = _project_name(workspace_folder)
 
         return SessionInfo(
             source=source,
@@ -388,6 +442,8 @@ class CursorAdapter(SourceAdapter):
             title=title,
             project=project,
             created_at=created_at,
+            model=model,
+            is_empty=is_empty,
         )
 
     # ----- helpers ---------------------------------------------------------
@@ -561,6 +617,8 @@ def _convert_cursor_session(
             except (json.JSONDecodeError, TypeError):
                 continue
 
+        mrc_workspace = _workspace_from_request_context(conn, composer_id)
+
     # Order bubbles per fullConversationHeadersOnly when present
     headers = composer.get("fullConversationHeadersOnly") or []
     order: list[str] = [
@@ -615,6 +673,11 @@ def _convert_cursor_session(
             v = mc.get("modelName")
             if isinstance(v, str) and v:
                 default_model = v
+    # Last resort: per-bubble modelInfo. Recovers composers that have
+    # no model fields at the composer level but whose individual
+    # bubbles do — seen on ~8% of bubbles in real-world DBs.
+    if not default_model:
+        default_model = _model_from_bubbles(bubbles)
 
     started_at: datetime | None = _parse_ts(composer.get("createdAt"))
     ended_at: datetime | None = started_at
@@ -678,6 +741,7 @@ def _convert_cursor_session(
     effective_workspace = (
         workspace_folder
         or _get_workspace_map().get(composer_id)
+        or mrc_workspace
     )
     if effective_workspace:
         conversation["project"] = {
@@ -997,6 +1061,83 @@ def _split_path(p: str) -> list[str]:
 def _hash_short(value: str, length: int = 12) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 
+
+
+def _workspace_from_request_context(
+    conn: sqlite3.Connection, composer_id: str
+) -> str | None:
+    """Pull the workspace absolute path from ``messageRequestContext``.
+
+    Each request Cursor sent persists a context payload at
+    ``messageRequestContext:<composer_id>:<reqId|WARM_SUBMIT>`` whose
+    ``projectLayouts[].listDirV2Result.directoryTreeRoot.absPath`` is
+    the full local path of the workspace open at that time.  This is
+    the most reliable source for composers that don't carry
+    ``workspaceFolder`` themselves and aren't tied to any per-workspace
+    state.vscdb via :func:`_get_workspace_map`.
+
+    Returns the first absolute path found, or ``None`` if no MRC row
+    exists or none carry a usable ``projectLayouts`` entry.  Only a
+    handful of composers are covered this way (~13/170 on the
+    maintainer's machine), but the result is deterministic.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT value FROM cursorDiskKV "
+            "WHERE key LIKE ? AND value IS NOT NULL LIMIT 5",
+            (f"messageRequestContext:{composer_id}:%",),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    for row in rows:
+        try:
+            data = json.loads(row["value"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        layouts = data.get("projectLayouts") if isinstance(data, dict) else None
+        if not isinstance(layouts, list):
+            continue
+        for layout in layouts:
+            # ``projectLayouts`` entries are sometimes stored as JSON
+            # strings rather than dicts (observed on Cursor _v=10).
+            if isinstance(layout, str):
+                try:
+                    layout = json.loads(layout)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            if not isinstance(layout, dict):
+                continue
+            ldv2 = layout.get("listDirV2Result")
+            if isinstance(ldv2, dict):
+                root = ldv2.get("directoryTreeRoot")
+                if isinstance(root, dict):
+                    abs_path = root.get("absPath")
+                    if isinstance(abs_path, str) and abs_path:
+                        return abs_path
+    return None
+
+
+def _model_from_bubbles(bubbles: dict[str, dict[str, Any]]) -> str | None:
+    """Per-bubble model fallback when composer-level fields are empty.
+
+    Roughly 8% of bubbles carry ``modelInfo.modelName`` even on
+    composers that have no ``modelConfig`` and no
+    ``latestConversationSummary.model``.  Returns the first non-empty
+    value found, scanning bubbles in arbitrary order — there's no
+    guarantee bubbles agree, but for OCF's ``default_model`` any
+    real model name is better than empty.
+    """
+    for bubble in bubbles.values():
+        if not isinstance(bubble, dict):
+            continue
+        mi = bubble.get("modelInfo")
+        if isinstance(mi, dict):
+            v = mi.get("modelName")
+            if isinstance(v, str) and v:
+                return v
+        elif isinstance(mi, str) and mi:
+            return mi
+    return None
 
 
 def _project_id(workspace_folder: str) -> str:
