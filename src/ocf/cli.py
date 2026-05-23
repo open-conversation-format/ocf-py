@@ -585,9 +585,17 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
     total = len(infos)
     ghost = sum(1 for i in infos if i.is_empty)
-    real = total - ghost
+    lost = sum(1 for i in infos if i.is_lost)
+    real = total - ghost - lost
 
-    visible = infos if args.show_all else [i for i in infos if not i.is_empty]
+    # Default keeps lost sessions visible — they're useful to *see*
+    # (you know what content the tool destroyed) even though they
+    # can't be exported. Ghost sessions are hidden because they
+    # carry no information at all.
+    visible = (
+        infos if args.show_all
+        else [i for i in infos if not i.is_empty]
+    )
     # Oldest first → newest at the bottom, so the most recent session
     # is what you see right above the summary footer. Sessions without
     # a created_at fall to the top (datetime.min sort key).
@@ -603,6 +611,8 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
     print(f"total: {total}", file=sys.stderr)
     print(f"ghost: {ghost}", file=sys.stderr)
+    if lost:
+        print(f"lost:  {lost}", file=sys.stderr)
     print(f"real:  {real}", file=sys.stderr)
     return 0
 
@@ -625,7 +635,10 @@ def _print_session_table(infos: list[SessionInfo]) -> None:
 
     for info in infos:
         sid = info.session_id[:8]
-        title = (info.title or "-")[:40]
+        raw_title = info.title or "-"
+        if info.is_lost:
+            raw_title = f"[lost] {raw_title}"
+        title = raw_title[:40]
         project = (info.project or "-")[:20]
         date = (
             info.created_at.strftime("%Y-%m-%d")

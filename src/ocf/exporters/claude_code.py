@@ -114,6 +114,20 @@ CB_IMAGE = "image"
 CB_TOOL_USE = "tool_use"
 CB_TOOL_RESULT = "tool_result"
 
+# Synthetic source marker for sessions known via Desktop metadata but
+# without an actual JSONL body on disk. Path('lost::<uuid>') is not a
+# real file but is acceptable as a Path-like token throughout the
+# adapter (we intercept it before any I/O).
+LOST_TOKEN_PREFIX = "lost::"
+
+
+def _lost_uuid(source: Path) -> str | None:
+    """Return the UUID from a ``lost::<uuid>`` source, or ``None``."""
+    s = str(source)
+    if s.startswith(LOST_TOKEN_PREFIX):
+        return s[len(LOST_TOKEN_PREFIX):]
+    return None
+
 
 def metadata_index_path(metadata_dir: Path | None = None) -> Path:
     """Default metadata-index root (``~/AppData/.../claude-code-sessions/``)."""
@@ -416,6 +430,14 @@ class ClaudeCodeAppAdapter(ClaudeCodeAdapter):
     Scans ``~/.claude/projects/`` and keeps ONLY sessions whose UUID
     has a matching entry in the Desktop App metadata index
     (``claude-code-sessions/<acc>/<org>/local_<cliSessionId>.json``).
+
+    Also surfaces "lost" sessions — those that have a metadata entry
+    but whose JSONL transcript never made it to disk (the known
+    `anthropics/claude-code#53717 <https://github.com/anthropics/claude-code/issues/53717>`_
+    Electron-flush bug). These appear as synthetic
+    ``lost::<uuid>`` sources so ``ocf list`` can show what was lost,
+    while ``export_one`` raises :class:`SkipExport` since there's
+    nothing to convert.
     """
 
     name: ClassVar[str] = "claude_code_app"
@@ -428,7 +450,52 @@ class ClaudeCodeAppAdapter(ClaudeCodeAdapter):
     ) -> list[Path]:
         all_files = super().discover(source_dirs)
         index = self._resolve_metadata_index()
-        return [f for f in all_files if f.stem in index]
+        matched = [f for f in all_files if f.stem in index]
+        matched_ids = {f.stem for f in matched}
+        # Synthetic lost-source for every metadata entry without a body
+        for sid in sorted(index):
+            if sid not in matched_ids:
+                matched.append(Path(f"{LOST_TOKEN_PREFIX}{sid}"))
+        return matched
+
+    def session_info(self, source: Path) -> SessionInfo:
+        uuid = _lost_uuid(source)
+        if uuid is None:
+            return super().session_info(source)
+        meta = self._resolve_metadata_index().get(uuid) or {}
+        created_at: datetime | None = None
+        ca = meta.get("createdAt")
+        if isinstance(ca, (int, float)):
+            created_at = datetime.fromtimestamp(ca / 1000, tz=timezone.utc)
+        cwd = meta.get("cwd") if isinstance(meta.get("cwd"), str) else None
+        title = meta.get("title") if isinstance(meta.get("title"), str) else None
+        model = meta.get("model") if isinstance(meta.get("model"), str) else None
+        return SessionInfo(
+            source=source,
+            session_id=uuid,
+            title=title,
+            project=_project_name(cwd) if cwd else None,
+            created_at=created_at,
+            model=model,
+            is_lost=True,
+        )
+
+    def export_one(
+        self, source: Path, *, validate: bool = True
+    ) -> dict[str, Any]:
+        uuid = _lost_uuid(source)
+        if uuid is not None:
+            raise SkipExport(
+                f"session {uuid} body missing (Claude Code Desktop "
+                f"data loss — see anthropics/claude-code#53717)"
+            )
+        return super().export_one(source, validate=validate)
+
+    def ocf_filename_for(self, source: Path) -> str:
+        uuid = _lost_uuid(source)
+        if uuid is not None:
+            return f"{uuid}.ocf.json"
+        return super().ocf_filename_for(source)
 
 
 class ClaudeCoworkAppAdapter(ClaudeCodeAdapter):

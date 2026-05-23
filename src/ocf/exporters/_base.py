@@ -72,6 +72,20 @@ class SessionInfo:
     count them without paying the full export cost.
     """
 
+    is_lost: bool = False
+    """True if the session is referenced by tool metadata but its
+    body is gone (cannot be exported).
+
+    Claude Code Desktop's known Electron-flush bug (see
+    `anthropics/claude-code#53717`) leaves session metadata in
+    ``claude-code-sessions/local_<uuid>.json`` while the actual
+    JSONL transcript in ``~/.claude/projects/`` never gets written
+    or vanishes on update. The sidebar in the app still shows the
+    title; opening the session shows nothing. Surfacing these in
+    ``ocf list`` lets the user *see* what was lost even though the
+    content cannot be recovered.
+    """
+
 
 class AmbiguousMatchError(LookupError):
     """Multiple sessions matched a name- or id-based query.
