@@ -169,6 +169,47 @@ def load_metadata_index(
     return index
 
 
+def load_cowork_metadata_index(
+    metadata_dir: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Load Cowork session sidecar metadata, keyed by ``cliSessionId``.
+
+    Each Cowork session has a sidecar file at
+    ``<root>/<acc>/<org>/local_<workTreeId>.json`` (next to the
+    worktree directory of the same stem) carrying ``title``, ``cwd``,
+    ``model``, ``processName``, and ``cliSessionId``. The
+    ``cliSessionId`` is the UUID of the main JSONL inside the
+    worktree, so keying by it lets ``session_info`` / ``export_one``
+    look it up by ``source.stem``.
+
+    We restrict the glob to two-level depth so worktree-internal
+    ``*.json`` files (settings, mcp configs, ...) don't get mistaken
+    for sidecars.
+    """
+    root = (
+        Path(metadata_dir)
+        if metadata_dir is not None
+        else claude_code_desktop_agent_mode_sessions_dir()
+    )
+    index: dict[str, dict[str, Any]] = {}
+    try:
+        paths = list(root.glob("*/*/local_*.json"))
+    except OSError:
+        return {}
+    for path in paths:
+        try:
+            with path.open(encoding="utf-8") as fh:
+                row = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        sid = row.get("cliSessionId")
+        if isinstance(sid, str):
+            index[sid] = row
+    return index
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -503,13 +544,51 @@ class ClaudeCoworkAppAdapter(ClaudeCodeAdapter):
 
     Scans ``<APPDATA>/Claude/local-agent-mode-sessions/`` only.
     Each spawned background agent gets its own sandboxed worktree
-    with ``.claude/projects/<encoded>/*.jsonl`` inside.
+    with ``.claude/projects/<encoded>/*.jsonl`` inside, plus a
+    sidecar ``local_<workTreeId>.json`` at the org level carrying
+    title / cwd / model / processName / cliSessionId.
+
+    Two Cowork-specific behaviors handled here:
+
+    - **audit.jsonl skip.** Every worktree carries an HMAC-signed
+      ``audit.jsonl`` that duplicates the main session's bubbles.
+      ``discover`` drops it when a real session jsonl exists in the
+      same worktree; if only the audit log survives (recovery case)
+      it is kept so the content is at least exportable.
+    - **Sidecar metadata.** ``_resolve_metadata_index`` loads the
+      Cowork sidecar JSONs so title, model, and project resolve to
+      what the Desktop App's sidebar shows, not the first user
+      prompt / container path.
     """
 
     name: ClassVar[str] = "claude_cowork_app"
 
     def default_source_dirs(self) -> list[Path]:
         return [claude_code_desktop_agent_mode_sessions_dir()]
+
+    def discover(
+        self, source_dirs: list[Path] | Path | None = None
+    ) -> list[Path]:
+        files = super().discover(source_dirs)
+        worktrees_with_main: set[Path] = set()
+        for f in files:
+            if f.name == "audit.jsonl":
+                continue
+            for parent in f.parents:
+                if parent.name.startswith("local_"):
+                    worktrees_with_main.add(parent)
+                    break
+        return [
+            f for f in files
+            if f.name != "audit.jsonl" or f.parent not in worktrees_with_main
+        ]
+
+    def _resolve_metadata_index(self) -> dict[str, dict[str, Any]]:
+        path = self._metadata_dir_override
+        key = f"cowork::{path or '__default__'}"
+        if key not in self._index_cache:
+            self._index_cache[key] = load_cowork_metadata_index(path)
+        return self._index_cache[key]
 
 
 # ---------------------------------------------------------------------------
