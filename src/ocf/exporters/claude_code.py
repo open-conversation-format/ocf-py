@@ -676,6 +676,7 @@ def _convert_claude_code_session(
     started_at: datetime | None = None
     ended_at: datetime | None = None
     title: str | None = None
+    first_user_text: str | None = None
 
     # Look up Desktop App metadata if available
     meta_row = metadata_index.get(session_id) or {}
@@ -727,6 +728,10 @@ def _convert_claude_code_session(
             ev_cwd = ev.get("cwd")
             if isinstance(ev_cwd, str) and ev_cwd and not cwd:
                 cwd = ev_cwd
+            if first_user_text is None:
+                msg = ev.get("message")
+                if isinstance(msg, dict):
+                    first_user_text = _extract_user_text(msg)
             envelopes = _envelopes_from_user(ev, next_msg_id, ts)
             messages.extend(envelopes)
             continue
@@ -735,6 +740,9 @@ def _convert_claude_code_session(
             ev_cwd = ev.get("cwd")
             if isinstance(ev_cwd, str) and ev_cwd and not cwd:
                 cwd = ev_cwd
+            msg = ev.get("message") or {}
+            if not default_model and isinstance(msg.get("model"), str):
+                default_model = msg["model"]
             envelopes = _envelopes_from_assistant(
                 ev, next_msg_id, ts, default_model
             )
@@ -744,6 +752,12 @@ def _convert_claude_code_session(
         if etype == EVENT_TOOL_RESULT:
             messages.append(_envelope_from_tool_result(ev, next_msg_id, ts))
             continue
+
+    # Last-resort title fallback: synthesize from the first user prompt
+    # if neither metadata nor an ai-title event provided one. Matches
+    # the same behavior in session_info() so list and export agree.
+    if not title and first_user_text:
+        title = _title_from_user_text(first_user_text)
 
     conversation: dict[str, Any] = {
         "id": f"conv_claude_code_{session_id}",
