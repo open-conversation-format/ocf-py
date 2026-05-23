@@ -172,17 +172,25 @@ def load_metadata_index(
 def load_cowork_metadata_index(
     metadata_dir: Path | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Load Cowork session sidecar metadata, keyed by ``cliSessionId``.
+    """Load Cowork session sidecar metadata, keyed by ``cliSessionId``
+    AND by every jsonl stem inside the matching worktree.
 
     Each Cowork session has a sidecar file at
     ``<root>/<acc>/<org>/local_<workTreeId>.json`` (next to the
     worktree directory of the same stem) carrying ``title``, ``cwd``,
-    ``model``, ``processName``, and ``cliSessionId``. The
-    ``cliSessionId`` is the UUID of the main JSONL inside the
-    worktree, so keying by it lets ``session_info`` / ``export_one``
-    look it up by ``source.stem``.
+    ``model``, ``processName``, and ``cliSessionId``. Normally the
+    ``cliSessionId`` matches the main JSONL's UUID stem, so keying
+    by it lets ``session_info`` / ``export_one`` look it up by
+    ``source.stem``.
 
-    We restrict the glob to two-level depth so worktree-internal
+    **Worktree fallback.** Some sidecars carry ``cliSessionId: None``
+    — observed when Cowork failed to update the sidecar after the
+    session was created. To recover those, every jsonl stem actually
+    present in the sibling worktree directory also points at the
+    sidecar metadata (``setdefault`` so explicit ``cliSessionId``
+    entries still win on collision).
+
+    We restrict the sidecar glob to two-level depth so worktree-internal
     ``*.json`` files (settings, mcp configs, ...) don't get mistaken
     for sidecars.
     """
@@ -193,20 +201,32 @@ def load_cowork_metadata_index(
     )
     index: dict[str, dict[str, Any]] = {}
     try:
-        paths = list(root.glob("*/*/local_*.json"))
+        sidecar_paths = list(root.glob("*/*/local_*.json"))
     except OSError:
         return {}
-    for path in paths:
+    for sidecar in sidecar_paths:
         try:
-            with path.open(encoding="utf-8") as fh:
+            with sidecar.open(encoding="utf-8") as fh:
                 row = json.load(fh)
         except (json.JSONDecodeError, OSError):
             continue
         if not isinstance(row, dict):
             continue
-        sid = row.get("cliSessionId")
-        if isinstance(sid, str):
-            index[sid] = row
+        cli_sid = row.get("cliSessionId")
+        if isinstance(cli_sid, str) and cli_sid:
+            index[cli_sid] = row
+        # Worktree fallback — sibling dir is `local_<id>/` next to
+        # `local_<id>.json`. Index every jsonl found in it (except
+        # audit.jsonl, which is the HMAC duplicate trail).
+        worktree_dir = sidecar.with_suffix("")
+        try:
+            jsonls = list(worktree_dir.rglob("*.jsonl"))
+        except OSError:
+            jsonls = []
+        for jsonl in jsonls:
+            if jsonl.name == "audit.jsonl":
+                continue
+            index.setdefault(jsonl.stem, row)
     return index
 
 
