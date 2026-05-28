@@ -78,6 +78,19 @@ BUBBLE_TEXT_FIELDS = ("text", "rawText")
 BUBBLE_THINKING_FIELD = "thinking"
 BUBBLE_CODE_BLOCKS_FIELD = "codeBlocks"
 
+# Cursor internal model names that are routing aliases, not real models.
+# These appear in modelConfig.modelName when the user selected a Cursor
+# tier (e.g. "composer-2-fast") rather than a specific provider model.
+# We filter them out so the exported model field only contains real
+# provider model identifiers.
+_CURSOR_INTERNAL_MODELS: frozenset[str] = frozenset({
+    "composer-1",
+    "composer-1.5",
+    "composer-2",
+    "composer-2-fast",
+    "default",
+})
+
 # Lazy workspace map: composer_id -> workspace folder path
 _workspace_map: dict[str, str] | None = None
 
@@ -658,26 +671,86 @@ def _convert_cursor_session(
         v = lcs.get("title")
         if isinstance(v, str) and v:
             title = v
-    default_model = lcs.get("model") if isinstance(lcs, dict) else None
-    # Fallback: check 'modelId' or 'model' on composer itself
-    if not default_model:
-        for key in ("model", "modelId", "modelName"):
-            v = composer.get(key)
-            if isinstance(v, str) and v:
-                default_model = v
+    # -- Model resolution ------------------------------------------------
+    # Cursor stores model info at multiple levels (in priority order):
+    #   1. Per-bubble: bubble.modelInfo.modelName (old format, ~pre-2026)
+    #   2. Per-bubble: bubble.modelId / bubble.model (some versions)
+    #   3. Per-session: composerData.usageData keys (cost-tracking dict
+    #      keyed by real model names, e.g. {"claude-4.5-sonnet": {...}})
+    #   4. Per-session: modelConfig.modelName (current format, often
+    #      contains Cursor-internal routing aliases like "composer-2")
+    #
+    # We prefer bubble-level models because they reflect the actual model
+    # that produced each response. modelConfig often contains internal
+    # aliases that aren't real provider model identifiers.
+    #
+    # Build a bubble_id -> model mapping for per-envelope assignment,
+    # then derive the session-level default_model from unique real models.
+
+    bubble_models: dict[str, str] = {}  # bid -> model name
+    for bid, bdata in bubbles.items():
+        if bdata.get("type") != 2:  # assistant only
+            continue
+        # Try modelInfo.modelName first (old format, most reliable)
+        mi = bdata.get("modelInfo")
+        if isinstance(mi, dict):
+            mn = mi.get("modelName")
+            if isinstance(mn, str) and mn:
+                bubble_models[bid] = mn
+                continue
+        # Try modelId / model (some Cursor versions, per agentlytics)
+        for field in ("modelId", "model"):
+            v = bdata.get(field)
+            if isinstance(v, str) and v and v not in _CURSOR_INTERNAL_MODELS:
+                bubble_models[bid] = v
                 break
-    # Fallback: modelConfig.modelName (current Cursor versions)
-    if not default_model:
-        mc = composer.get("modelConfig")
-        if isinstance(mc, dict):
-            v = mc.get("modelName")
-            if isinstance(v, str) and v:
-                default_model = v
-    # Last resort: per-bubble modelInfo. Recovers composers that have
-    # no model fields at the composer level but whose individual
-    # bubbles do — seen on ~8% of bubbles in real-world DBs.
-    if not default_model:
-        default_model = _model_from_bubbles(bubbles)
+
+    # Unique models actually used in bubbles (preserving first-seen order)
+    seen_bubble_models: list[str] = []
+    for bid in order:
+        m = bubble_models.get(bid)
+        if m and m not in seen_bubble_models:
+            seen_bubble_models.append(m)
+
+    # Session-level fallback chain (all filtered for internal names):
+    #   1. usageData keys (cost-tracking, contains real model names)
+    #   2. lcs.model / composer.model / modelId / modelName
+    #   3. modelConfig.modelName
+    session_model: str | None = None
+
+    # usageData: dict keyed by real model names with cost info
+    usage_data = composer.get("usageData")
+    if isinstance(usage_data, dict):
+        real_usage = [
+            k for k in usage_data
+            if isinstance(k, str) and k not in _CURSOR_INTERNAL_MODELS
+        ]
+        if real_usage:
+            session_model = ", ".join(sorted(real_usage))
+
+    if not session_model:
+        for candidate in [
+            lcs.get("model") if isinstance(lcs, dict) else None,
+            *[composer.get(k) for k in ("model", "modelId", "modelName")],
+            (composer.get("modelConfig") or {}).get("modelName")
+            if isinstance(composer.get("modelConfig"), dict)
+            else None,
+        ]:
+            if (
+                isinstance(candidate, str)
+                and candidate
+                and candidate not in _CURSOR_INTERNAL_MODELS
+            ):
+                session_model = candidate
+                break
+
+    # Final default_model: prefer bubble-level models (comma-separated
+    # if the user switched models mid-session), else the session-level
+    # fallback.
+    if seen_bubble_models:
+        default_model: str | None = ", ".join(seen_bubble_models)
+    else:
+        default_model = session_model
 
     started_at: datetime | None = _parse_ts(composer.get("createdAt"))
     ended_at: datetime | None = started_at
@@ -687,7 +760,9 @@ def _convert_cursor_session(
         bubble = bubbles.get(bid)
         if not bubble:
             continue
-        envs = _bubble_to_envelopes(bid, bubble, default_model)
+        # Per-bubble model if available, else session-level fallback
+        envelope_model = bubble_models.get(bid) or session_model
+        envs = _bubble_to_envelopes(bid, bubble, envelope_model)
         for env in envs:
             messages.append(env)
         if envs:
@@ -1116,28 +1191,6 @@ def _workspace_from_request_context(
                         return abs_path
     return None
 
-
-def _model_from_bubbles(bubbles: dict[str, dict[str, Any]]) -> str | None:
-    """Per-bubble model fallback when composer-level fields are empty.
-
-    Roughly 8% of bubbles carry ``modelInfo.modelName`` even on
-    composers that have no ``modelConfig`` and no
-    ``latestConversationSummary.model``.  Returns the first non-empty
-    value found, scanning bubbles in arbitrary order — there's no
-    guarantee bubbles agree, but for OCF's ``default_model`` any
-    real model name is better than empty.
-    """
-    for bubble in bubbles.values():
-        if not isinstance(bubble, dict):
-            continue
-        mi = bubble.get("modelInfo")
-        if isinstance(mi, dict):
-            v = mi.get("modelName")
-            if isinstance(v, str) and v:
-                return v
-        elif isinstance(mi, str) and mi:
-            return mi
-    return None
 
 
 def _project_id(workspace_folder: str) -> str:

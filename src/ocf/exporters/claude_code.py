@@ -1098,6 +1098,14 @@ def _envelopes_from_assistant(
             u["input"] = usage["input_tokens"]
         if isinstance(usage.get("output_tokens"), int):
             u["output"] = usage["output_tokens"]
+        if isinstance(usage.get("cache_read_input_tokens"), int):
+            u["cache_read"] = usage["cache_read_input_tokens"]
+        if isinstance(usage.get("cache_creation_input_tokens"), int):
+            u["cache_write"] = usage["cache_creation_input_tokens"]
+        # Thinking tokens live in output_tokens_details.thinking_tokens
+        otd = usage.get("output_tokens_details")
+        if isinstance(otd, dict) and isinstance(otd.get("thinking_tokens"), int):
+            u["thinking"] = otd["thinking_tokens"]
         if u:
             envelope["usage"] = u
 

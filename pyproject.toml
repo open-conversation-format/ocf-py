@@ -1,6 +1,6 @@
 [project]
 name = "ocf-py"
-version = "0.1.0.dev0"
+version = "0.1.1"
 description = "Reference Python implementation of the Open Conversation Format (OCF)."
 readme = "README.md"
 requires-python = ">=3.11"
