@@ -564,6 +564,22 @@ class ClaudeCodeAppAdapter(ClaudeCodeAdapter):
             return f"{uuid}.ocf.json"
         return super().ocf_filename_for(source)
 
+    def source_fingerprint(
+        self, source: Path
+    ) -> tuple[int, int, str]:
+        """Lost sources have no file on disk — fingerprint by uuid only.
+
+        The base implementation does ``source.stat()`` which raises
+        on the synthetic ``lost::<uuid>`` token. Return a constant
+        fingerprint per uuid so the manifest can still track that
+        ``export_one`` raised :class:`SkipExport` for this source
+        (and not re-run it next time).
+        """
+        uuid = _lost_uuid(source)
+        if uuid is not None:
+            return (0, 0, f"lost:{uuid}")
+        return super().source_fingerprint(source)
+
 
 class ClaudeCoworkAppAdapter(ClaudeCodeAdapter):
     """Background Agent ("Cowork") sessions from the Claude Desktop App.
