@@ -51,6 +51,13 @@ _SORTABLE_ATTRIBUTES = [
 # Default index name
 DEFAULT_INDEX = "ocf-sessions"
 
+# Meilisearch's default wait_for_task timeout is 5000ms — too short for
+# batches over ~200 docs or when the server is under load. Give tasks
+# 5 minutes to finalize. Tasks that don't finish in that window will
+# still be applied server-side; we just miss the confirmation and count
+# the batch as failed locally.
+_TASK_TIMEOUT_MS = 300_000
+
 
 @dataclass
 class IndexResult:
@@ -161,16 +168,16 @@ def ensure_index(
     """
     # Create index (idempotent - Meilisearch ignores if exists)
     task = client.create_index(index_name, {"primaryKey": "id"})
-    client.wait_for_task(task.task_uid)
+    client.wait_for_task(task.task_uid, timeout_in_ms=_TASK_TIMEOUT_MS)
 
     index = client.index(index_name)
 
     # Set filterable + sortable attributes
     task = index.update_filterable_attributes(_FILTERABLE_ATTRIBUTES)
-    client.wait_for_task(task.task_uid)
+    client.wait_for_task(task.task_uid, timeout_in_ms=_TASK_TIMEOUT_MS)
 
     task = index.update_sortable_attributes(_SORTABLE_ATTRIBUTES)
-    client.wait_for_task(task.task_uid)
+    client.wait_for_task(task.task_uid, timeout_in_ms=_TASK_TIMEOUT_MS)
 
     return index
 
@@ -188,7 +195,7 @@ def index_documents(
         batch = documents[i : i + batch_size]
         task = index.add_documents(batch)
         if client:
-            client.wait_for_task(task.task_uid)
+            client.wait_for_task(task.task_uid, timeout_in_ms=_TASK_TIMEOUT_MS)
         total += len(batch)
     return total
 
