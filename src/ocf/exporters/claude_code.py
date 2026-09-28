@@ -26,7 +26,8 @@ Each line in a session jsonl is one event with a top-level ``type``:
 - ``user`` - user message; carries ``parentUuid`` (native threading!),
   ``promptId``, and a ``message`` payload with Anthropic-style content.
 - ``assistant`` - assistant message; ``message.content`` may include
-  ``text``, ``thinking`` (with ``signature``), ``tool_use`` blocks.
+  ``text``, ``thinking`` (with ``signature``), ``tool_use``, and
+  ``fallback`` (model-fallback notice, >= 2.1.247) blocks.
 - ``tool_result`` - tool result; references a prior ``tool_use.id``.
 - ``attachment`` - separate event when the user attaches files.
 - ``ai-title`` - assistant-generated session title (rare).
@@ -43,6 +44,9 @@ OCF mapping highlights
   assistant message envelope.
 - ``tool_result`` event -> OCF ``role: "tool"`` envelope with
   ``tool_call_id`` from the source's ``tool_use_id``.
+- ``fallback`` block -> ``meta.claude_code_render.model_fallback``
+  (``{"from": ..., "to": ...}`` model names); the envelope keeps an
+  empty-string content so it stays wire-strict.
 """
 
 from __future__ import annotations
@@ -113,6 +117,12 @@ CB_THINKING = "thinking"
 CB_IMAGE = "image"
 CB_TOOL_USE = "tool_use"
 CB_TOOL_RESULT = "tool_result"
+# Model-fallback notice (Claude Code >= 2.1.247): the request fell back
+# from one model to another (e.g. fable-5 -> opus). Written as its own
+# assistant JSONL entry whose content is a single {"type": "fallback",
+# "from": {"model": ...}, "to": {"model": ...}} block - no displayable
+# content, but the entry still carries usage (with a fallback iteration).
+CB_FALLBACK = "fallback"
 
 # Synthetic source marker for sessions known via Desktop metadata but
 # without an actual JSONL body on disk. Path('lost::<uuid>') is not a
@@ -1036,12 +1046,21 @@ def _envelopes_from_assistant(
     ocf_content: list[dict[str, Any]] = []
     tool_calls: list[dict[str, Any]] = []
     thinking_signatures: list[str] = []
+    model_fallback: dict[str, Any] | None = None
 
     blocks = content if isinstance(content, list) else []
     for block in blocks:
         if not isinstance(block, dict):
             continue
         bt = block.get("type")
+        if bt == CB_FALLBACK:
+            fb: dict[str, Any] = {}
+            for side in ("from", "to"):
+                val = block.get(side)
+                if isinstance(val, dict) and isinstance(val.get("model"), str):
+                    fb[side] = val["model"]
+            model_fallback = fb
+            continue
         if bt == CB_TEXT:
             txt = block.get("text", "")
             if isinstance(txt, str) and txt:
@@ -1084,7 +1103,10 @@ def _envelopes_from_assistant(
 
     inner: dict[str, Any] = {"role": "assistant"}
     if not ocf_content:
-        inner["content"] = None
+        # Wire schema: assistant content may only be null alongside
+        # tool_calls. Metadata-only entries (e.g. a lone fallback
+        # block) keep an empty string so the document stays strict.
+        inner["content"] = None if tool_calls else ""
     elif len(ocf_content) == 1 and ocf_content[0]["type"] == "text":
         inner["content"] = ocf_content[0]["text"]
     else:
@@ -1105,6 +1127,8 @@ def _envelopes_from_assistant(
     }
     if thinking_signatures:
         envelope["meta"]["claude_code_render"]["thinking_signatures"] = thinking_signatures
+    if model_fallback is not None:
+        envelope["meta"]["claude_code_render"]["model_fallback"] = model_fallback
     if ts is not None:
         envelope["created_at"] = _format_iso(ts)
     if isinstance(parent_uuid, str) and parent_uuid:

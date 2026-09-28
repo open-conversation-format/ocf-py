@@ -244,6 +244,51 @@ def test_export_one_anthropic_msg_id_in_meta(claude_session_file: Path) -> None:
     )
 
 
+def test_export_one_fallback_block(tmp_path: Path) -> None:
+    """A lone model-fallback block converts to a wire-valid envelope.
+
+    Claude Code >= 2.1.247 writes the fallback notice as its own
+    assistant entry whose only content block is {"type": "fallback"}.
+    """
+    events = _claude_events()
+    events.insert(2, {
+        "type": "assistant",
+        "parentUuid": None,
+        "isSidechain": False,
+        "timestamp": "2026-04-26T10:00:08Z",
+        "message": {
+            "id": "msg_anthropic_fb",
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [{
+                "type": "fallback",
+                "from": {"model": "claude-fable-5"},
+                "to": {"model": "claude-opus-4-8"},
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        },
+    })
+    proj = tmp_path / ".claude" / "projects" / "home-user-projects-demo"
+    proj.mkdir(parents=True)
+    f = proj / f"{CLAUDE_SESSION_UUID}.jsonl"
+    with f.open("w", encoding="utf-8", newline="\n") as fh:
+        for ev in events:
+            fh.write(json.dumps(ev) + "\n")
+
+    doc = export_one(f)
+    errors = validate(doc)
+    assert errors == [], [e.message for e in errors]
+
+    fb_msg = doc["messages"][1]
+    assert fb_msg["message"]["role"] == "assistant"
+    assert fb_msg["message"]["content"] == ""
+    assert "tool_calls" not in fb_msg["message"]
+    assert fb_msg["meta"]["claude_code_render"]["model_fallback"] == {
+        "from": "claude-fable-5",
+        "to": "claude-opus-4-8",
+    }
+
+
 def test_export_one_telemetry_dropped(claude_session_file: Path) -> None:
     """queue-operation event must not produce an OCF message."""
     doc = export_one(claude_session_file)
