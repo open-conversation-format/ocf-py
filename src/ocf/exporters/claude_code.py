@@ -279,6 +279,17 @@ class ClaudeCodeAdapter(SourceAdapter):
             claude_code_desktop_agent_mode_sessions_dir(),
         ]
 
+    def discover(
+        self, source_dirs: list[Path] | Path | None = None
+    ) -> list[Path]:
+        files = super().discover(source_dirs)
+        # journal.jsonl is the Workflow tool's event journal
+        # (<session-uuid>/subagents/workflows/wf_*/journal.jsonl):
+        # started/finished events per orchestrated agent, never a
+        # conversation. The agent-*.jsonl files next to it ARE real
+        # transcripts and pass through the existing patterns.
+        return [f for f in files if f.name != "journal.jsonl"]
+
     def find_by_name(
         self,
         query: str,

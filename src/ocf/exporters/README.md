@@ -79,7 +79,11 @@ Known upstream bugs affecting export completeness:
 
 Worth re-checking on each Claude Code release whether new sub-agent
 filename patterns appear (currently: UUID-stem, `agent-*.jsonl`,
-`agent-acompact-*.jsonl`, and the excluded `audit.jsonl`).
+`agent-acompact-*.jsonl`, and the excluded `audit.jsonl` and
+`journal.jsonl` - the latter is the Workflow tool's event journal
+under `<session-uuid>/subagents/workflows/wf_*/`, seen 2026-09).
+The same workflow dirs hold real `agent-*.jsonl` transcripts plus
+`.meta.json` sidecars (not yet read).
 
 ## codex
 

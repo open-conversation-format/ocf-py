@@ -337,6 +337,37 @@ def test_discover_finds_all(claude_projects_dir: Path) -> None:
     assert len(files) == 2
 
 
+def test_discover_skips_workflow_journal(claude_projects_dir: Path) -> None:
+    """journal.jsonl (Workflow event journal) is not a session.
+
+    Lives under <project>/<session-uuid>/subagents/workflows/wf_*/
+    next to real agent-*.jsonl transcripts, which must still pass.
+    """
+    wf = (
+        claude_projects_dir
+        / "home-user-foo"
+        / "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        / "subagents"
+        / "workflows"
+        / "wf_12345678-abc"
+    )
+    wf.mkdir(parents=True)
+    (wf / "journal.jsonl").write_text(
+        '{"type":"started","key":"v2:deadbeef","agentId":"a1"}\n',
+        encoding="utf-8",
+    )
+    agent = wf / "agent-a0123456789abcdef.jsonl"
+    with agent.open("w", encoding="utf-8", newline="\n") as fh:
+        for ev in _claude_events():
+            fh.write(json.dumps(ev) + "\n")
+
+    files = discover(claude_projects_dir)
+    names = [f.name for f in files]
+    assert "journal.jsonl" not in names
+    assert "agent-a0123456789abcdef.jsonl" in names
+    assert len(files) == 3
+
+
 def test_find_by_id_session_uuid(claude_projects_dir: Path) -> None:
     matches = find_by_id(
         "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", source_dir=claude_projects_dir
