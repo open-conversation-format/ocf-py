@@ -1076,6 +1076,12 @@ def _envelopes_from_assistant(
                 }
             )
 
+    # Assistant events can consist solely of block types that carry no
+    # conversation content (e.g. the ``fallback`` model-switch marker).
+    # An envelope with neither content nor tool_calls is schema-invalid.
+    if not ocf_content and not tool_calls:
+        return []
+
     inner: dict[str, Any] = {"role": "assistant"}
     if not ocf_content:
         inner["content"] = None
