@@ -24,7 +24,7 @@ changes before we notice them in the wild.
 | Tool | Upstream | Releases / Changelog | Storage docs |
 | --- | --- | --- | --- |
 | **Claude Code** | https://github.com/anthropics/claude-code | [Releases](https://github.com/anthropics/claude-code/releases), [CHANGELOG](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | [code.claude.com/docs/en/data-usage](https://code.claude.com/docs/en/data-usage) |
-| **Codex CLI** | https://github.com/openai/codex | [Releases](https://github.com/openai/codex/releases) | Read the repo's `codex-rs/core/src/rollout/` for the current event schema |
+| **Codex CLI** | https://github.com/openai/codex | [Releases](https://github.com/openai/codex/releases) | Read the repo's `codex-rs/rollout/src/` (incl. `compression.rs`, `rollout_file_name.rs`) and `codex-rs/history/src/` (RolloutItem wire types) |
 | **Cursor IDE** | closed-source | [Changelog](https://cursor.com/changelog) — announces UI features but rarely storage-schema changes; expect to learn about DB changes from the reverse-engineering tools below |
 | **Anthropic SDK** (usage schema source) | https://github.com/anthropics/anthropic-sdk-python | [Releases](https://github.com/anthropics/anthropic-sdk-python/releases) — usage-block field additions land here first (e.g. `cache_read_input_tokens`) |
 
@@ -34,12 +34,50 @@ Adapter: [`cursor.py`](cursor.py). Storage map: [`docs/cursor-storage.md`](../..
 
 | Project | URL | Stars | Last reviewed | What it reads | Notable |
 | --- | --- | ---:| --- | --- | --- |
-| **thomas-pedersen / cursor-chat-browser** | https://github.com/thomas-pedersen/cursor-chat-browser ([issues](https://github.com/thomas-pedersen/cursor-chat-browser/issues), [commits](https://github.com/thomas-pedersen/cursor-chat-browser/commits/main)) | 514 | 2026-05-23 | `ItemTable.composer.composerData`, global `composerData:*`, `bubbleId:*`, `messageRequestContext:*` | Best-in-class workspace mapping via `projectLayouts[].rootPath`. No model detection. Multi-root `.code-workspace` unhandled. Issue [#18](https://github.com/thomas-pedersen/cursor-chat-browser/issues/18) — Cursor v44.9 globalStorage shift; [#27](https://github.com/thomas-pedersen/cursor-chat-browser/issues/27) — 0.48.6 workspaceStorage break. |
-| **saharmor / cursor-view** | https://github.com/saharmor/cursor-view ([issues](https://github.com/saharmor/cursor-view/issues), [commits](https://github.com/saharmor/cursor-view/commits/main)) | 126 | 2026-05-23 | `bubbleId:*`, per-workspace `history.entries[*].editor.resource` | Naive common-prefix of attached file paths for workspace. Drops model. Drops `toolFormerData`. |
-| **S2thend / cursor-history** + **cursor-history-mcp** | https://github.com/S2thend/cursor-history ([issues](https://github.com/S2thend/cursor-history/issues), [commits](https://github.com/S2thend/cursor-history/commits/main)) | 73 + 31 | 2026-05-23 | `composer.composerData`, `workbench.panel.aichat.view.aichat.chatdata`, **`workbench.panel.chat.view.chat.chatdata`** (post v44.9 key — others miss), `aiService.prompts`, `aiService.generations`, `bubbleId:{composerId}:%` | Probes `sqlite_master` for table existence first — copy this pattern when handling drift. Doesn't parse model, doesn't parse tools. |
-| **Cedriccmh / cursor-trace-exporter** | https://github.com/Cedriccmh/cursor-trace-exporter ([issues](https://github.com/Cedriccmh/cursor-trace-exporter/issues), [commits](https://github.com/Cedriccmh/cursor-trace-exporter/commits/main)) | 7 | 2026-05-23 | Everything in 83 columns: `toolFormerData`, `toolResults`, `supportedTools`, `capabilities*`, `thinking`, `allThinkingBlocks`, `thinkingDurationMs`, `unifiedMode`, `modelInfo` (raw blob) | Most exhaustive field dump in the field, but no semantic parsing. Useful as a "is this field still there?" reference dump. |
-| **lucifer1004 / cursor-helper** | https://github.com/lucifer1004/cursor-helper ([issues](https://github.com/lucifer1004/cursor-helper/issues), [commits](https://github.com/lucifer1004/cursor-helper/commits/main)) | 19 | 2026-05-23 | Rewrites `composer.composerData` + `folderUri` mappings | Reference for project-move / rename-detection, not for export. |
-| **somogyijanos / cursor-chat-export** | https://github.com/somogyijanos/cursor-chat-export (archived 2025-06-17) | — | 2026-05-23 | Legacy `tabs/bubbles` only | Pre-`cursorDiskKV` format. Not useful for current Cursor. |
+| **thomas-pedersen / cursor-chat-browser** | https://github.com/thomas-pedersen/cursor-chat-browser ([issues](https://github.com/thomas-pedersen/cursor-chat-browser/issues), [commits](https://github.com/thomas-pedersen/cursor-chat-browser/commits/main)) | 516 | 2026-10-23 | `ItemTable.composer.composerData`, global `composerData:*`, `bubbleId:*`, `messageRequestContext:*` | Best-in-class workspace mapping via `projectLayouts[].rootPath`. No model detection. Multi-root `.code-workspace` unhandled. Issue [#18](https://github.com/thomas-pedersen/cursor-chat-browser/issues/18) - Cursor v44.9 globalStorage shift; [#27](https://github.com/thomas-pedersen/cursor-chat-browser/issues/27) - 0.48.6 workspaceStorage break. Since 2026-05 only [PR #40](https://github.com/thomas-pedersen/cursor-chat-browser/pull/40) (null check); last commit 2026-08-23. |
+| **saharmor / cursor-view** | https://github.com/saharmor/cursor-view ([issues](https://github.com/saharmor/cursor-view/issues), [commits](https://github.com/saharmor/cursor-view/commits/main)) | 134 | 2026-10-23 | `bubbleId:*`, per-workspace `history.entries[*].editor.resource` | Naive common-prefix of attached file paths for workspace. Drops model. Drops `toolFormerData`. (stale 2026-10: last commit 2025-09-12) |
+| **S2thend / cursor-history** + **cursor-history-mcp** | https://github.com/S2thend/cursor-history ([issues](https://github.com/S2thend/cursor-history/issues), [commits](https://github.com/S2thend/cursor-history/commits/main)) | 152 + 33 | 2026-10-23 | `composer.composerData`, `workbench.panel.aichat.view.aichat.chatdata`, **`workbench.panel.chat.view.chat.chatdata`** (post v44.9 key - others miss), `aiService.prompts`, `aiService.generations`, `bubbleId:{composerId}:%` | Probes `sqlite_master` for table existence first - copy this pattern when handling drift. Doesn't parse model, doesn't parse tools. Very active (138 commits since 2026-05): CLI/WSL/ACP "store stack" (`~/.cursor/chats/<md5(cwd)>/<uuid>/store.db`, `~/.cursor/projects/<slug>/agent-transcripts/`, issue [#31](https://github.com/S2thend/cursor-history/issues/31)), recovery of sessions without workspace stamp (v0.16), bounded Composer SQLite readers. |
+| **Cedriccmh / cursor-trace-exporter** | https://github.com/Cedriccmh/cursor-trace-exporter ([issues](https://github.com/Cedriccmh/cursor-trace-exporter/issues), [commits](https://github.com/Cedriccmh/cursor-trace-exporter/commits/main)) | 7 | 2026-10-23 | Everything in 83 columns: `toolFormerData`, `toolResults`, `supportedTools`, `capabilities*`, `thinking`, `allThinkingBlocks`, `thinkingDurationMs`, `unifiedMode`, `modelInfo` (raw blob) | Most exhaustive field dump in the field, but no semantic parsing. Useful as a "is this field still there?" reference dump. |
+| **lucifer1004 / cursor-helper** | https://github.com/lucifer1004/cursor-helper ([issues](https://github.com/lucifer1004/cursor-helper/issues), [commits](https://github.com/lucifer1004/cursor-helper/commits/main)) | 27 | 2026-10-23 | Rewrites `composer.composerData` + `folderUri` mappings | Reference for project-move / rename-detection, not for export. Issue [#9](https://github.com/lucifer1004/cursor-helper/issues/9) documents `hasMigratedComposerData` (workspace `composer.composerData` now only holds `selectedComposerIds`). |
+| **somogyijanos / cursor-chat-export** | https://github.com/somogyijanos/cursor-chat-export (archived 2025-06-17) | 247 | 2026-10-23 | Legacy `tabs/bubbles` only | Pre-`cursorDiskKV` format. Not useful for current Cursor. |
+
+**Multi-provider tools with traction** (found 2026-10-23, not yet
+reviewed in depth - check them first when a format change is suspected):
+[jazzyalex/agent-sessions](https://github.com/jazzyalex/agent-sessions)
+(909 stars, reads Codex `.jsonl.zst`, see commit `3a3bd27`),
+[Dicklesworthstone/coding_agent_session_search](https://github.com/Dicklesworthstone/coding_agent_session_search)
+(1190 stars, 11+ providers, tests for compressed Codex rollouts),
+[jhlee0409/claude-code-history-viewer](https://github.com/jhlee0409/claude-code-history-viewer)
+(2277 stars),
+[sybil-solutions/ai-data-extraction](https://github.com/sybil-solutions/ai-data-extraction)
+(1351 stars),
+[mikhailsal/cursor-chronicle](https://github.com/mikhailsal/cursor-chronicle)
+(24 stars).
+
+**Cursor 3.x storage notes (census 2026-10-23, Cursor 3.27.6):**
+- Composer `_v: 18` no longer stores `fullConversationHeadersOnly`
+  inline (empty list). The headers (same shape) moved to chunked keys
+  `composerConvHeaders:<cid>:<000000..>`, which the adapter reads -
+  they decide order and selection (Cursor leaves empty capability
+  bubbles out of them). Bubbles are still under `bubbleId:<cid>:<bid>`.
+  With no headers at all, bubbles are ordered by `createdAt` (the SQL
+  scan returns insertion order, which drifts on bubble rewrites).
+- New SQLite table `composerHeaders` (`composerId, workspaceId,
+  createdAt, lastUpdatedAt, isArchived, isSubagent, recency,
+  checkpointAt, value, subagentTypeName`) - sidebar list headers,
+  flagged by `cursorDiskKV['composer.composerHeaders.migratedToTable']
+  = 1`. Not read yet; `workspaceId` / `isSubagent` could improve
+  workspace mapping and sub-agent detection.
+- `agentKv:blob:<sha256>` (~142k keys) holds content-addressed agent
+  messages (e.g. `{"role":"tool","content":[{"type":"tool-result"}]}`);
+  composerData carries `conversationState` (encoded) and
+  `blobEncryptionKey`. This becomes the content source if Cursor ever
+  stops writing `bubbleId:*`. Also new: `composer.content.<sha>`.
+- CLI / WSL / ACP sessions use a separate "store stack"
+  (`~/.cursor/chats/<md5(cwd)>/<uuid>/store.db`, lossy
+  `~/.cursor/projects/<slug>/agent-transcripts/*.jsonl`). On the
+  maintainer's machine all agent transcripts also exist as composers,
+  so nothing is missed today.
 
 **Gaps where ocf-py is unique:**
 - Model detection via `modelConfig.modelName` (nobody else does this).
@@ -52,20 +90,59 @@ Adapter: [`cursor.py`](cursor.py). Storage map: [`docs/cursor-storage.md`](../..
 
 Adapter: [`claude_code.py`](claude_code.py).
 
-No mature third-party reference exports identified — the JSONL format
-under `~/.claude/projects/` is well-documented by Anthropic in
+The JSONL format under `~/.claude/projects/` is documented by Anthropic in
 [code.claude.com/docs/en/data-usage](https://code.claude.com/docs/en/data-usage)
-and the format is more stable than Cursor's.
+and [claude-directory](https://code.claude.com/docs/en/claude-directory),
+and is more stable than Cursor's. Reference implementation worth
+watching: [daaain/claude-code-log](https://github.com/daaain/claude-code-log)
+(1249 stars, Python, reviewed 2026-10-23) - handles Workflow invocation
+shapes, teammate sub-agents, the forks/workflows DAG, and has a Codex
+provider with fork-prefix fan-out.
 
-The **Desktop App** paths are less documented:
+The **Desktop App** paths are less documented. `<data>` is
+`%LOCALAPPDATA%/Claude-Data/claude_<hash>/` since the app's data
+migration on 2026-10-20 (both old locations, `%APPDATA%/Claude/` and
+the MSIX container's `LocalCache/Roaming/Claude/`, keep only an empty
+`.user-data-left.claude_<hash>` marker). `utils/paths.py` resolves to
+whichever candidate holds session data.
 
-- `%APPDATA%/Claude/claude-code-sessions/<acc>/<org>/local_<sid>.json`
-  — sidecar metadata for regular sessions
-- `%APPDATA%/Claude/local-agent-mode-sessions/<acc>/<org>/<workTreeId>/`
-  — Cowork background-agent worktrees, each with its own `audit.jsonl`
-  (HMAC-signed duplicate — see `39d7622` commit for handling)
-- `%APPDATA%/Claude/local-agent-mode-sessions/<acc>/<org>/local_<workTreeId>.json`
-  — Cowork sidecar metadata
+- `<data>/claude-code-sessions/<acc>/<org>/local_<sid>.json`
+  - sidecar metadata for regular sessions
+- `<data>/local-agent-mode-sessions/<acc>/<org>/<workTreeId>/`
+  - Cowork background-agent worktrees, each with its own `audit.jsonl`
+  (HMAC-signed duplicate - see `39d7622` commit for handling)
+- `<data>/local-agent-mode-sessions/<acc>/<org>/local_<workTreeId>.json`
+  - Cowork sidecar metadata
+
+JSONL event types seen as of 2.1.30x (census 2026-10-23). Converted:
+`user`, `assistant`, `tool_result`, `ai-title`, `custom-title` (user
+rename - wins over every other title source), `system` (metadata).
+User `document` blocks (attached PDFs / text files) become OCF `file`
+blocks. Deliberately ignored as telemetry / UI state: `attachment`,
+`queue-operation`, `last-prompt`, `mode`, `permission-mode`,
+`atis-latch`, `agent-name`, `cost-state`, `file-history-snapshot`,
+`file-history-delta`, `bridge-session`, `relocated`, `frame-link`,
+`teleported-from`, `summary` (legacy), and the request-logging trio
+`api-request`, `api-request-shape`, `api-request-blob` (these carry
+`message` payloads with system prompts - never treat them as turns).
+Sessions that yield no messages at all (e.g. summary-only stub files:
+a single `{"type": "summary"}` line) raise `SkipExport`, as do empty
+Codex rollouts; 1310 such stubs from April/May 2026 still sit in the
+G: archive with an export-time `created_at`.
+
+Open points (2026-10-23):
+- Desktop sidecars gained `priorCliSessionIds` (earlier JSONLs of the
+  same Desktop session; the newer JSONL repeats their messages with the
+  same uuids). The metadata index keys only on `cliSessionId`, so those
+  earlier files are classified as CLI and overlap in content. Also new:
+  `forkedFromSessionId`, `bridgeSessionIds`, `titleTurn`; some sidecars
+  have no `cliSessionId`.
+- `relocated {relocatedCwd}` (`/cd`) is ignored; the project stays the
+  first cwd.
+- Set-aside transcripts `<session>.orphaned-<ts>-<suffix>.jsonl` match
+  `*.jsonl` and would export as separate sessions (none seen yet).
+- 2.1.299 stopped keeping PDF bytes in transcripts; 2.1.287 spills large
+  MCP results into `<session>/tool-results/` (preview only inline).
 
 Known upstream bugs affecting export completeness:
 - [anthropics/claude-code#53717](https://github.com/anthropics/claude-code/issues/53717)
@@ -91,6 +168,32 @@ Adapter: [`codex.py`](codex.py).
 
 Reads OpenAI Responses-API event JSONL. Format is documented by the
 Codex CLI repo itself.
+
+Storage changes seen with Codex Desktop's bundled 0.163 (2026-10; the
+`codex` CLI on PATH can lag far behind the Desktop app's version):
+
+- **zstd compression.** Finished rollouts are rewritten in place as
+  `rollout-*.jsonl.zst`; the active one stays plain until it is done.
+  The adapter discovers both (plain wins if both exist) and maps them
+  to the same OCF filename / `original_id`.
+- **Paginated history** (`session_meta.history_mode: "paginated"`).
+  Past ~50 MB a thread continues in a new file
+  `rollout-<ts>-<thread>_<page>.jsonl` whose `session_meta` repeats the
+  thread id and carries `history_base: {thread_id,
+  end_ordinal_exclusive, end_byte_offset}`. Each page is exported as its
+  own OCF document; `history_base` is kept in `meta.codex` so pages can
+  be linked. Merging pages into one conversation is open.
+- Archived threads move to `~/.codex/archived_sessions/` (also scanned).
+- Paginated mode no longer writes the old `event_msg` content types
+  (`user_message`, `agent_message`, ...) or `thread_name_updated`;
+  `response_item` lines still carry the conversation. Not converted
+  yet: `response_item:agent_message` (inter-agent messages with
+  `author`/`recipient`; none on the maintainer's machine so far).
+- New ignored event types: `world_state`, `token_usage_record`,
+  `compacted` (its `replacement_history` duplicates earlier items),
+  `response_item:additional_tools`. Titles still come from
+  `~/.codex/session_index.jsonl`; `state_5.sqlite` (`threads` table)
+  holds the same titles plus `rollout_path`.
 
 | Project | URL | Notes |
 | --- | --- | --- |
