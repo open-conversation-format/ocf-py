@@ -21,8 +21,15 @@ standalone Python) see the real location under::
 
     %LOCALAPPDATA%\\Packages\\Claude_<hash>\\LocalCache\\Roaming\\Claude\\
 
+Since 2026-10 the app moves its user data out of the container into::
+
+    %LOCALAPPDATA%\\Claude-Data\\claude_<hash>\\
+
+leaving only an empty ``.user-data-left.claude_<hash>`` marker in both
+old locations.
+
 :func:`_claude_desktop_data_dir` transparently resolves to whichever
-location actually exists.
+location actually holds the session data.
 """
 
 from __future__ import annotations
@@ -61,37 +68,60 @@ def codex_sessions_dir() -> Path:
     return home() / ".codex" / "sessions"
 
 
+
 # ---------------------------------------------------------------------------
 # Claude Desktop App — MSIX-aware data directory
 # ---------------------------------------------------------------------------
+
+_CLAUDE_DESKTOP_SESSION_SUBDIRS = ("claude-code-sessions", "local-agent-mode-sessions")
+
+
+def _claude_desktop_candidates() -> list[Path]:
+    """Possible Claude Desktop data dirs, most current layout first."""
+    candidates: list[Path] = []
+    local = os.environ.get("LOCALAPPDATA") if sys.platform.startswith("win") else None
+    if local:
+        try:
+            candidates.extend(
+                sorted(
+                    p for p in (Path(local) / "Claude-Data").iterdir()
+                    if p.is_dir() and p.name.lower().startswith("claude_")
+                )
+            )
+        except OSError:
+            pass
+    candidates.append(appdata() / "Claude")
+    if local:
+        try:
+            for pkg in sorted((Path(local) / "Packages").iterdir()):
+                if pkg.name.lower().startswith("claude_") and pkg.is_dir():
+                    candidates.append(pkg / "LocalCache" / "Roaming" / "Claude")
+        except OSError:
+            pass
+    return candidates
+
 
 @lru_cache(maxsize=1)
 def _claude_desktop_data_dir() -> Path:
     """Resolve the Claude Desktop App's data directory.
 
-    1. ``%APPDATA%/Claude/`` — works inside the MSIX container
-       (i.e. when Claude Code runs as a child of the Desktop App).
-    2. ``%LOCALAPPDATA%/Packages/Claude_*/LocalCache/Roaming/Claude/``
-       — the real path that external processes (user shells) must use.
-    3. Falls back to ``%APPDATA%/Claude/`` even if it doesn't exist
-       (best-effort for non-Windows or unusual setups).
+    Returns the first candidate that actually contains session data:
+
+    1. ``%LOCALAPPDATA%/Claude-Data/claude_*/`` - current layout (the
+       app migrated its data here; old dirs only keep a marker file).
+    2. ``%APPDATA%/Claude/`` - pre-migration; also what processes inside
+       the MSIX container see.
+    3. ``%LOCALAPPDATA%/Packages/Claude_*/LocalCache/Roaming/Claude/``
+       - the real pre-migration path for external processes.
+
+    Existence alone is not enough: after the migration ``%APPDATA%/Claude``
+    still exists, holding only the ``.user-data-left.*`` marker. Falls
+    back to ``%APPDATA%/Claude/`` when no candidate has session data.
     """
-    candidate = appdata() / "Claude"
-    if candidate.exists():
-        return candidate
-    if sys.platform.startswith("win"):
-        local = os.environ.get("LOCALAPPDATA")
-        if local:
-            packages = Path(local) / "Packages"
-            try:
-                for pkg in packages.iterdir():
-                    if pkg.name.lower().startswith("claude_") and pkg.is_dir():
-                        msix = pkg / "LocalCache" / "Roaming" / "Claude"
-                        if msix.exists():
-                            return msix
-            except OSError:
-                pass
-    return candidate  # fallback: original path even if missing
+    for candidate in _claude_desktop_candidates():
+        if any((candidate / sub).is_dir() for sub in _CLAUDE_DESKTOP_SESSION_SUBDIRS):
+            return candidate
+    return appdata() / "Claude"
 
 
 # ---------------------------------------------------------------------------
