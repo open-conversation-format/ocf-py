@@ -51,6 +51,7 @@ OCF mapping highlights
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from collections.abc import Iterable
@@ -108,6 +109,10 @@ EVENT_TOOL_RESULT = "tool_result"
 EVENT_TOOL_USE = "tool_use"
 EVENT_ATTACHMENT = "attachment"
 EVENT_AI_TITLE = "ai-title"
+# User-chosen session title (/rename, forks get a " (fork)" suffix).
+# Re-emitted many times per session; the last one is current. Beats
+# every other title source.
+EVENT_CUSTOM_TITLE = "custom-title"
 EVENT_QUEUE_OPERATION = "queue-operation"
 EVENT_LAST_PROMPT = "last-prompt"
 
@@ -117,6 +122,8 @@ CB_THINKING = "thinking"
 CB_IMAGE = "image"
 CB_TOOL_USE = "tool_use"
 CB_TOOL_RESULT = "tool_result"
+# Attached document (PDF as base64, plain text as text source).
+CB_DOCUMENT = "document"
 # Model-fallback notice (Claude Code >= 2.1.247): the request fell back
 # from one model to another (e.g. fable-5 -> opus). Written as its own
 # assistant JSONL entry whose content is a single {"type": "fallback",
@@ -377,12 +384,14 @@ class ClaudeCodeAdapter(SourceAdapter):
         model = meta.get("model") if isinstance(meta.get("model"), str) else None
         created_at: datetime | None = None
         first_user_text: str | None = None
+        custom_title: str | None = None
 
         # Peek the JSONL: first few events for metadata (cwd on user/
         # assistant events, model in message.model, ai-title as aiTitle).
+        # custom-title usually shows up within the first ~30 events.
         try:
             for i, ev in enumerate(iter_jsonl_tailsafe(source)):
-                if i > 10:
+                if i > 40:
                     break
                 ts = _parse_iso(ev.get("timestamp"))
                 if created_at is None and ts is not None:
@@ -408,12 +417,19 @@ class ClaudeCodeAdapter(SourceAdapter):
                 elif etype == EVENT_AI_TITLE:
                     if not title and isinstance(ev.get("aiTitle"), str):
                         title = ev["aiTitle"]
+                elif etype == EVENT_CUSTOM_TITLE:
+                    if isinstance(ev.get("customTitle"), str) and ev["customTitle"]:
+                        custom_title = ev["customTitle"]
         except OSError:
             pass
 
-        # Reverse-peek for ai-title if we didn't find one yet
-        if not title:
-            title = _peek_ai_title_tail(source)
+        # Reverse-peek: the tail holds the current custom-title (renames)
+        # and is where ai-title lands in tool-heavy sessions.
+        tail_custom, tail_ai = _peek_title_tail(source)
+        if tail_custom or custom_title:
+            title = tail_custom or custom_title
+        elif not title:
+            title = tail_ai
 
         # Last resort: synthesize a title from the first user prompt.
         # Claude Code only writes ``ai-title`` events asynchronously and
@@ -818,6 +834,7 @@ def _convert_claude_code_session(
     started_at: datetime | None = None
     ended_at: datetime | None = None
     title: str | None = None
+    custom_title: str | None = None
     first_user_text: str | None = None
 
     # Look up Desktop App metadata if available
@@ -860,6 +877,12 @@ def _convert_claude_code_session(
                 title = t
             continue
 
+        if etype == EVENT_CUSTOM_TITLE:
+            t = ev.get("customTitle")
+            if isinstance(t, str) and t:
+                custom_title = t
+            continue
+
         if etype in (EVENT_QUEUE_OPERATION, EVENT_LAST_PROMPT, EVENT_ATTACHMENT):
             # Telemetry / not yet modeled. attachment is potentially
             # interesting future work (-> resources[]).
@@ -894,6 +917,14 @@ def _convert_claude_code_session(
         if etype == EVENT_TOOL_RESULT:
             messages.append(_envelope_from_tool_result(ev, next_msg_id, ts))
             continue
+
+    if not messages:
+        # e.g. summary-only stubs: one {"type": "summary"} line, no turns.
+        # Same policy as the Cursor adapter's empty-composer skip.
+        raise SkipExport("no messages")
+
+    if custom_title:
+        title = custom_title
 
     # Last-resort title fallback: synthesize from the first user prompt
     # if neither metadata nor an ai-title event provided one. Matches
@@ -1000,6 +1031,10 @@ def _envelopes_from_user(
                     user_content.append(
                         {"type": "image_url", "image_url": {"url": url}}
                     )
+            elif bt == CB_DOCUMENT:
+                file_block = _file_block_from_document(block)
+                if file_block is not None:
+                    user_content.append(file_block)
             elif bt == CB_TOOL_RESULT:
                 # Inline tool_result inside user content - emit as its own
                 # role:tool envelope ahead of (or instead of) the user msg.
@@ -1240,14 +1275,20 @@ def _envelope_from_tool_result_block(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _peek_ai_title_tail(path: Path, tail_bytes: int = 8192) -> str | None:
-    """Read the last few KB of a JSONL to find an ``ai-title`` event.
+def _peek_title_tail(
+    path: Path, tail_bytes: int = 8192
+) -> tuple[str | None, str | None]:
+    """Read the last few KB of a JSONL for the latest title events.
 
-    ai-title events appear after the first assistant response, which
-    can be dozens of events deep in tool-heavy sessions. Reading the
-    whole file is too expensive for 1000+ sessions; instead we read
-    the tail and parse any complete JSON lines found there.
+    Returns ``(custom_title, ai_title)`` - the last ``custom-title`` and
+    ``ai-title`` found in the tail, either may be ``None``. ai-title
+    events appear after the first assistant response, which can be
+    dozens of events deep in tool-heavy sessions. Reading the whole
+    file is too expensive for 1000+ sessions; instead we read the tail
+    and parse any complete JSON lines found there.
     """
+    custom: str | None = None
+    ai: str | None = None
     try:
         size = path.stat().st_size
         if size == 0:
@@ -1269,13 +1310,45 @@ def _peek_ai_title_tail(path: Path, tail_bytes: int = 8192) -> str | None:
                 ev = json.loads(line)
             except (json.JSONDecodeError, TypeError):
                 continue
-            if ev.get("type") == EVENT_AI_TITLE:
+            etype = ev.get("type")
+            if etype == EVENT_CUSTOM_TITLE and custom is None:
+                t = ev.get("customTitle")
+                if isinstance(t, str) and t:
+                    custom = t
+            elif etype == EVENT_AI_TITLE and ai is None:
                 t = ev.get("aiTitle")
                 if isinstance(t, str) and t:
-                    return t
+                    ai = t
+            if custom is not None:
+                break
     except OSError:
         pass
-    return None
+    return custom, ai
+
+
+def _file_block_from_document(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Anthropic ``document`` block -> OCF ``file`` block with a data URI.
+
+    ``base64`` sources (PDFs) pass through; ``text`` sources are
+    base64-encoded so the attachment stays byte-identical. Other source
+    kinds (URLs, file IDs) carry no inline content and are dropped.
+    """
+    src = block.get("source")
+    if not isinstance(src, dict) or not isinstance(src.get("data"), str):
+        return None
+    media = src.get("media_type") if isinstance(src.get("media_type"), str) else None
+    if src.get("type") == "base64":
+        data_b64 = src["data"]
+        media = media or "application/octet-stream"
+    elif src.get("type") == "text":
+        data_b64 = base64.b64encode(src["data"].encode("utf-8")).decode("ascii")
+        media = media or "text/plain"
+    else:
+        return None
+    file_obj: dict[str, Any] = {"file_data": f"data:{media};base64,{data_b64}"}
+    if isinstance(block.get("title"), str) and block["title"]:
+        file_obj["filename"] = block["title"]
+    return {"type": "file", "file": file_obj}
 
 
 def _extract_user_text(msg: dict[str, Any]) -> str | None:

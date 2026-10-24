@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from ocf.core.schema import is_valid, validate
+from ocf.exporters._base import SkipExport
 from ocf.exporters._manifest import load_manifest
 from ocf.exporters.claude_code import (
     AmbiguousMatchError,
@@ -242,6 +243,70 @@ def test_export_one_anthropic_msg_id_in_meta(claude_session_file: Path) -> None:
         assistant["meta"]["claude_code_render"]["anthropic_message_id"]
         == "msg_anthropic_001"
     )
+
+
+def test_summary_only_stub_is_skipped(tmp_path: Path) -> None:
+    """A JSONL holding only a summary line is no conversation."""
+    proj = tmp_path / ".claude" / "projects" / "home-user-projects-demo"
+    proj.mkdir(parents=True)
+    f = proj / f"{CLAUDE_SESSION_UUID}.jsonl"
+    f.write_text(
+        json.dumps({"type": "summary", "summary": "Ramen shop conversation",
+                    "leafUuid": "892a1c3a-708a-4955-b4cf-d1c4f1232ac6"}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SkipExport):
+        export_one(f)
+
+    out = tmp_path / "out"
+    result = export_all(out, source_dir=proj.parent)
+    assert len(result.skipped) == 1 and not result.new and not result.failed
+    assert not list(out.glob("*.ocf.json"))
+
+
+def test_document_blocks_become_file_blocks(tmp_path: Path) -> None:
+    """Attached documents (PDF base64, plain text) survive as OCF file blocks."""
+    events = _claude_events()
+    events[1]["message"]["content"].extend([
+        {"type": "document", "title": "notes.md",
+         "source": {"type": "text", "media_type": "text/plain", "data": "Hällo"}},
+        {"type": "document",
+         "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}},
+    ])
+    proj = tmp_path / ".claude" / "projects" / "home-user-projects-demo"
+    proj.mkdir(parents=True)
+    f = proj / f"{CLAUDE_SESSION_UUID}.jsonl"
+    with f.open("w", encoding="utf-8", newline="\n") as fh:
+        for ev in events:
+            fh.write(json.dumps(ev) + "\n")
+
+    doc = export_one(f)
+    assert validate(doc) == []
+    files = [b["file"] for b in doc["messages"][0]["message"]["content"] if b["type"] == "file"]
+    assert files == [
+        {"file_data": "data:text/plain;base64,SMOkbGxv", "filename": "notes.md"},
+        {"file_data": "data:application/pdf;base64,JVBERi0="},
+    ]
+
+
+def test_custom_title_beats_ai_title_and_first_prompt(tmp_path: Path) -> None:
+    """custom-title (/rename) is the user's own title; the last one wins."""
+    events = _claude_events()
+    events.insert(1, {"type": "custom-title", "customTitle": "Old name",
+                      "sessionId": CLAUDE_SESSION_UUID})
+    events.append({"type": "custom-title", "customTitle": "Renamed session",
+                   "sessionId": CLAUDE_SESSION_UUID})
+    proj = tmp_path / ".claude" / "projects" / "home-user-projects-demo"
+    proj.mkdir(parents=True)
+    f = proj / f"{CLAUDE_SESSION_UUID}.jsonl"
+    with f.open("w", encoding="utf-8", newline="\n") as fh:
+        for ev in events:
+            fh.write(json.dumps(ev) + "\n")
+
+    doc = export_one(f)
+    assert doc["conversation"]["title"] == "Renamed session"
+    assert all(m["message"]["role"] != "custom-title" for m in doc["messages"])
+    assert ClaudeCodeCliAdapter().session_info(f).title == "Renamed session"
 
 
 def test_export_one_fallback_block(tmp_path: Path) -> None:
