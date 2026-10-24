@@ -36,6 +36,7 @@ from ocf.exporters._manifest import (
     save_manifest,
 )
 from ocf.utils.hashing import sha256_file
+from ocf.utils.jsonl import ZSTD_SUFFIX
 
 
 _UUID_PATTERN = re.compile(
@@ -202,13 +203,15 @@ class SourceAdapter(ABC):
     def ocf_filename_for(self, source: Path) -> str:
         """Map a source to its OCF output filename.
 
-        Default: strip ``.jsonl`` or ``.json`` from ``source.name`` and
-        append ``.ocf.json``. Adapters whose sources are synthetic
-        tokens (e.g. CursorAdapter's ``state.vscdb::composerData:<id>``)
-        override this to produce a filesystem-legal filename — Windows
-        rejects ``:`` in filenames except for drive prefixes.
+        Default: strip ``.jsonl`` or ``.json`` (plus a trailing ``.zst``)
+        from ``source.name`` and append ``.ocf.json``, so a compressed
+        and an uncompressed copy of one source share one OCF file.
+        Adapters whose sources are synthetic tokens (e.g.
+        CursorAdapter's ``state.vscdb::composerData:<id>``) override this
+        to produce a filesystem-legal filename - Windows rejects ``:`` in
+        filenames except for drive prefixes.
         """
-        stem = source.name
+        stem = source.name.removesuffix(ZSTD_SUFFIX)
         for ext in (".jsonl", ".json"):
             if stem.endswith(ext):
                 stem = stem[: -len(ext)]

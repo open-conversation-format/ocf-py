@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from ocf.core.schema import is_valid, validate
+from ocf.exporters._base import SkipExport
 from ocf.exporters._manifest import load_manifest
 from ocf.exporters.codex import (
     AmbiguousMatchError,
@@ -29,6 +30,7 @@ from ocf.exporters.codex import (
     load_session_index,
     resolve_sources,
 )
+from ocf.utils import jsonl as jsonl_mod
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +166,17 @@ def test_export_one_no_session_meta_raises(tmp_path: Path) -> None:
         export_one(bad)
 
 
+def test_export_one_session_without_messages_is_skipped(
+    codex_rollout_file: Path,
+) -> None:
+    """A rollout with session_meta but no conversation items is skipped."""
+    meta_line = codex_rollout_file.read_text(encoding="utf-8").splitlines()[0]
+    empty = codex_rollout_file.with_name("rollout-2026-04-26T12-31-00-empty.jsonl")
+    empty.write_text(meta_line + "\n", encoding="utf-8")
+    with pytest.raises(SkipExport):
+        export_one(empty)
+
+
 def test_export_one_assistant_model_attached(codex_rollout_file: Path) -> None:
     """Model from turn_context attaches to assistant messages."""
     doc = export_one(codex_rollout_file)
@@ -250,6 +263,78 @@ def test_load_session_index_skips_malformed_lines(tmp_path: Path) -> None:
 def test_discover_finds_all_rollouts(codex_multi_sessions_dir: Path) -> None:
     files = discover(codex_multi_sessions_dir)
     assert len(files) == 3
+
+
+# ---------------------------------------------------------------------------
+# zstd-compressed rollouts (Codex >= 0.16x) and paginated history
+# ---------------------------------------------------------------------------
+
+def _compress(path: Path, *, keep_plain: bool = False) -> Path:
+    zst = path.with_name(path.name + ".zst")
+    zst.write_bytes(jsonl_mod.zstd.compress(path.read_bytes()))
+    if not keep_plain:
+        path.unlink()
+    return zst
+
+
+def test_export_one_reads_zstd_rollout(codex_rollout_file: Path) -> None:
+    plain_doc = export_one(codex_rollout_file)
+    zst = _compress(codex_rollout_file)
+
+    doc = export_one(zst)
+    assert validate(doc) == []
+    assert doc["messages"] == plain_doc["messages"]
+    assert doc["conversation"]["source"]["original_id"] == codex_rollout_file.name
+
+
+def test_discover_includes_compressed_and_prefers_plain(
+    codex_multi_sessions_dir: Path,
+) -> None:
+    plain = sorted(codex_multi_sessions_dir.rglob("rollout-*.jsonl"))
+    only_zst = _compress(plain[0])
+    _compress(plain[1], keep_plain=True)  # both copies present
+
+    files = discover(codex_multi_sessions_dir)
+    assert len(files) == 3
+    assert only_zst in files
+    assert plain[1] in files
+    assert plain[2] in files
+
+
+def test_export_all_compressed_source_reuses_ocf_file(
+    codex_sessions_dir: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    export_all(out, source_dir=codex_sessions_dir)
+    before = sorted(p.name for p in out.glob("*.ocf.json"))
+
+    _compress(next(codex_sessions_dir.rglob("rollout-*.jsonl")))
+    result = export_all(out, source_dir=codex_sessions_dir)
+
+    assert len(result.failed) == 0
+    assert sorted(p.name for p in out.glob("*.ocf.json")) == before
+
+
+def test_export_one_paginated_history_base_in_meta(codex_rollout_file: Path) -> None:
+    lines = codex_rollout_file.read_text(encoding="utf-8").splitlines()
+    meta = json.loads(lines[0])
+    history_base = {
+        "thread_id": meta["payload"]["id"],
+        "end_ordinal_exclusive": 6242,
+        "end_byte_offset": 50251350,
+    }
+    meta["payload"]["history_base"] = history_base
+    page2 = codex_rollout_file.with_name(
+        codex_rollout_file.name.replace(".jsonl", "_01a15fce-da81-7ba3-8dbf-37f4121961f8.jsonl")
+    )
+    page2.write_text(
+        "\n".join([json.dumps(meta), *lines[1:]]) + "\n", encoding="utf-8"
+    )
+
+    doc = export_one(page2)
+    assert validate(doc) == []
+    assert doc["conversation"]["meta"]["codex"]["history_base"] == history_base
+    assert "history_base" not in export_one(codex_rollout_file)["conversation"]["meta"]["codex"]
 
 
 def test_discover_nonexistent_dir_returns_empty(tmp_path: Path) -> None:

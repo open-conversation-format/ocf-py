@@ -68,6 +68,10 @@ def codex_sessions_dir() -> Path:
     return home() / ".codex" / "sessions"
 
 
+def codex_archived_sessions_dir() -> Path:
+    """Where Codex moves archived threads: ``~/.codex/archived_sessions/``."""
+    return home() / ".codex" / "archived_sessions"
+
 
 # ---------------------------------------------------------------------------
 # Claude Desktop App — MSIX-aware data directory

@@ -30,12 +30,13 @@ from ocf.core.schema import validate_strict
 from ocf.exporters._base import (
     AmbiguousMatchError,
     SessionInfo,
+    SkipExport,
     SourceAdapter,
     export_all as _export_all_generic,
 )
 from ocf.exporters._common import ExportResult
-from ocf.utils.jsonl import iter_jsonl_tailsafe
-from ocf.utils.paths import codex_sessions_dir, home
+from ocf.utils.jsonl import ZSTD_SUFFIX, iter_jsonl_tailsafe
+from ocf.utils.paths import codex_archived_sessions_dir, codex_sessions_dir, home
 
 # Top-level Codex event types
 EVENT_SESSION_META = "session_meta"
@@ -110,7 +111,26 @@ class CodexAdapter(SourceAdapter):
     # ----- SourceAdapter interface ----------------------------------------
 
     def default_source_dirs(self) -> list[Path]:
-        return [codex_sessions_dir()]
+        return [codex_sessions_dir(), codex_archived_sessions_dir()]
+
+    def discover(
+        self, source_dirs: list[Path] | Path | None = None
+    ) -> list[Path]:
+        """Plain ``rollout-*.jsonl`` plus zstd-compressed ``*.jsonl.zst``.
+
+        Codex compresses finished rollouts in place. While a session is
+        active (or mid-compression) both copies can exist; the plain one
+        is the live file and wins.
+        """
+        by_name: dict[tuple[Path, str], Path] = {}
+        for d in self._normalize_source_dirs(source_dirs):
+            for pattern in (self.rollout_glob + ZSTD_SUFFIX, self.rollout_glob):
+                try:
+                    for f in d.rglob(pattern):
+                        by_name[(f.parent, _rollout_name(f))] = f
+                except OSError:
+                    continue
+        return sorted(by_name.values())
 
     def find_by_name(
         self,
@@ -159,7 +179,7 @@ class CodexAdapter(SourceAdapter):
                     model = md
 
         # Parse created_at from filename: rollout-<ISO>-<UUID>.jsonl
-        name = source.stem  # e.g. rollout-2026-04-26T10-00-00-<uuid>
+        name = Path(_rollout_name(source)).stem  # e.g. rollout-2026-04-26T10-00-00-<uuid>
         if name.startswith("rollout-") and len(name) > 30:
             ts_part = name[len("rollout-"):].rsplit("-", 5)[0]
             # Approximate: replace the T-separator hyphens back
@@ -177,7 +197,7 @@ class CodexAdapter(SourceAdapter):
 
         return SessionInfo(
             source=source,
-            session_id=session_id or source.stem,
+            session_id=session_id or name,
             title=title,
             project=project,
             created_at=created_at,
@@ -383,7 +403,7 @@ def _convert_codex_session(
             "not a recognizable Codex rollout file."
         )
     sm_payload = sm.get("payload", {}) or {}
-    session_id = sm_payload.get("id") or _hash_short(source.name)
+    session_id = sm_payload.get("id") or _hash_short(_rollout_name(source))
     cwd = sm_payload.get("cwd") or None
     originator = sm_payload.get("originator")
     cli_version = sm_payload.get("cli_version")
@@ -467,6 +487,9 @@ def _convert_codex_session(
             continue
         continue
 
+    if not messages:
+        raise SkipExport("no messages")
+
     conversation: dict[str, Any] = {
         "id": f"conv_codex_{session_id}",
         "title": title,
@@ -475,7 +498,7 @@ def _convert_codex_session(
         "source": {
             "platform": "codex",
             "export_tool": "ocf-py",
-            "original_id": source.name,
+            "original_id": _rollout_name(source),
         },
         "produced_by": {
             "tool": "ocf-py",
@@ -506,6 +529,11 @@ def _convert_codex_session(
         }
     if base_instr_text:
         conversation["meta"]["codex"]["base_instructions_text"] = base_instr_text
+    # Paginated history (Codex >= 0.16x): a long thread continues in a new
+    # rollout file whose session_meta points back at the previous page.
+    history_base = sm_payload.get("history_base")
+    if isinstance(history_base, dict):
+        conversation["meta"]["codex"]["history_base"] = history_base
 
     doc: dict[str, Any] = {
         "ocf_version": "0.1.0",
@@ -746,6 +774,11 @@ def _now_iso() -> str:
 
 def _hash_short(value: str, length: int = 16) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
+
+
+def _rollout_name(source: Path) -> str:
+    """Filename without a ``.zst`` suffix - stable across compression."""
+    return Path(source).name.removesuffix(ZSTD_SUFFIX)
 
 
 def _project_id(cwd: str) -> str:
