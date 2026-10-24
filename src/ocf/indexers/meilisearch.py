@@ -27,10 +27,13 @@ exists just replaces it. This makes the indexer fully idempotent.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -101,8 +104,15 @@ def _make_document(
     doc: dict[str, Any],
     tool_name: str,
     rendered_content: str,
+    *,
+    doc_key: str | None = None,
 ) -> dict[str, Any]:
-    """Build a Meilisearch document from an OCF document + rendered text."""
+    """Build a Meilisearch document from an OCF document + rendered text.
+
+    ``doc_key`` (the OCF archive filename stem) replaces the session id
+    in the document ``id`` - unique per archive file even where one
+    session spans several files (Codex history pages, sub-agents).
+    """
     conv = doc.get("conversation", {})
 
     session_id = _extract_session_id(conv)
@@ -125,7 +135,7 @@ def _make_document(
     # Build a human-readable document ID: <tool>__<datetime>__<session_id>
     # Meilisearch IDs allow only alphanumeric, hyphens, underscores.
     dt_part = f"__{created_datetime}" if created_datetime else ""
-    raw_id = f"{tool_name}{dt_part}__{session_id}"
+    raw_id = f"{tool_name}{dt_part}__{doc_key or session_id}"
     clean_id = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_id)
 
     return {
@@ -156,6 +166,93 @@ def _extract_project(conv: dict[str, Any]) -> str:
         parts = cwd.replace("\\", "/").rstrip("/").split("/")
         return parts[-1] if parts else ""
     return ""
+
+
+OCF_SUFFIX = ".ocf.json"
+RECOVERED_SUFFIX = ".meili.json"
+
+# Platform -> facet name where the platform alone is unambiguous.
+_PLATFORM_TOOLS = {"codex": "codex", "cursor": "cursor"}
+
+
+def archive_tool_name(doc: dict[str, Any], source_path: str | None = None) -> str:
+    """Facet ``tool`` for an archived OCF document.
+
+    1. ``conversation.meta.ocf_py.source_adapter`` (written by exports
+       since 2026-10).
+    2. Codex / Cursor follow from the platform.
+    3. Claude Code: a manifest source path under
+       ``local-agent-mode-sessions`` means Cowork. CLI and Desktop
+       sessions share ``~/.claude/projects`` and cannot be told apart
+       after the fact, so everything else is ``claude-code``.
+    """
+    conv = doc.get("conversation") or {}
+    tagged = ((conv.get("meta") or {}).get("ocf_py") or {}).get("source_adapter")
+    if isinstance(tagged, str) and tagged:
+        return tagged
+    platform = (conv.get("source") or {}).get("platform") or ""
+    if platform in _PLATFORM_TOOLS:
+        return _PLATFORM_TOOLS[platform]
+    if source_path and "local-agent-mode-sessions" in source_path.replace("\\", "/"):
+        return "claude-cowork-app"
+    return platform.replace("_", "-") or "unknown"
+
+
+def load_archive_provenance(archive_dir: Path) -> dict[str, str]:
+    """Map OCF filename -> original source path from ``.ocf-manifest.json``."""
+    path = Path(archive_dir) / ".ocf-manifest.json"
+    try:
+        exports = json.loads(path.read_text(encoding="utf-8")).get("exports", {})
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        e["ocf_path"]: e.get("source_path") or key
+        for key, e in exports.items()
+        if isinstance(e, dict) and e.get("ocf_path")
+    }
+
+
+def iter_archive_documents(
+    archive_dir: Path,
+    render: Callable[[dict[str, Any]], str],
+) -> Iterator[tuple[Path, dict[str, Any] | None, str | None]]:
+    """Yield ``(ocf_path, meili_doc, problem)`` for every archived OCF file.
+
+    ``problem`` is ``None`` for an indexable document, ``"empty"`` for a
+    document without messages (skipped, never indexed), or an error
+    description (``meili_doc`` is then ``None``).
+    """
+    archive_dir = Path(archive_dir)
+    provenance = load_archive_provenance(archive_dir)
+    for path in sorted(archive_dir.rglob("*" + OCF_SUFFIX)):
+        try:
+            doc = json.loads(path.read_bytes())
+        except (OSError, json.JSONDecodeError) as exc:
+            yield path, None, f"unreadable: {exc}"
+            continue
+        if not doc.get("messages"):
+            yield path, None, "empty"
+            continue
+        try:
+            rendered = render(doc)
+        except Exception as exc:  # noqa: BLE001
+            yield path, None, f"render failed: {exc}"
+            continue
+        tool = archive_tool_name(doc, provenance.get(path.name))
+        key = path.name[: -len(OCF_SUFFIX)]
+        yield path, _make_document(doc, tool, rendered, doc_key=key), None
+
+
+def iter_recovered_documents(recovered_dir: Path) -> Iterator[dict[str, Any]]:
+    """Index documents saved verbatim from an earlier index (``*.meili.json``).
+
+    For sessions whose source and OCF document no longer exist anywhere,
+    the old index copy is the only content left; it is pushed unchanged.
+    """
+    for path in sorted(Path(recovered_dir).glob("*" + RECOVERED_SUFFIX)):
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(doc, dict) and doc.get("id") and doc.get("content"):
+            yield doc
 
 
 def ensure_index(

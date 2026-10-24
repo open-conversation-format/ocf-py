@@ -38,6 +38,9 @@ from ocf.exporters._manifest import (
 from ocf.utils.hashing import sha256_file
 from ocf.utils.jsonl import ZSTD_SUFFIX
 
+SOURCE_ADAPTER_META_KEY = "ocf_py"
+"""``conversation.meta`` key holding ``{"source_adapter": <tool_name>}``."""
+
 
 _UUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?"
@@ -142,6 +145,11 @@ class SourceAdapter(ABC):
 
     rollout_glob: ClassVar[str] = "*.jsonl"
     """Default filename pattern for :meth:`discover`. Override per adapter."""
+
+    @property
+    def tool_name(self) -> str:
+        """CLI / index facet name: ``claude-code-cli``, ``codex``, ..."""
+        return self.name.replace("_", "-")
 
     # ------------------------------------------------------------------
     # Required overrides
@@ -444,6 +452,12 @@ def export_all(
                     manifest.set_entry(src, new_entry)
                 result.skipped.append(src)
                 continue
+            # Which adapter wrote this document. The OCF platform alone
+            # cannot tell Claude Code CLI / Desktop / Cowork apart, and the
+            # archive-based indexer needs that for its tool facet.
+            doc.setdefault("conversation", {}).setdefault("meta", {})[
+                SOURCE_ADAPTER_META_KEY
+            ] = {"source_adapter": adapter.tool_name}
             ocf_filename = adapter.ocf_filename_for(src)
             ocf_path = out_dir / ocf_filename
             ocf_bytes = canonical_dumps(doc)

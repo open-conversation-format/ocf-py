@@ -425,13 +425,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "index",
         help="Index sessions into Meilisearch for full-text search.",
         description=(
-            "Push sessions from one or all tools into a Meilisearch index.\n\n"
-            "  One-shot:  ocf index --url http://localhost:7700\n"
-            "  Watch:     ocf index --url http://localhost:7700 --watch\n"
-            "  One tool:  ocf index --url http://localhost:7700 --tool claude-code-app\n\n"
-            "Sessions are exported to OCF, rendered to Markdown, and pushed\n"
-            "as searchable documents with filterable facets (tool, project,\n"
-            "model, date). Re-indexing is idempotent (upsert by session ID)."
+            "Push sessions into a Meilisearch index.\n\n"
+            "  From the archive (recommended - the archive is the source of truth):\n"
+            "             ocf index --url URL --from-archive ./ocf-archive\n"
+            "  From this machine's live sessions:\n"
+            "             ocf index --url URL [--tool claude-code-app] [--watch]\n\n"
+            "Sessions are rendered to Markdown and pushed as searchable\n"
+            "documents with filterable facets (tool, project, model, date).\n"
+            "Re-indexing is idempotent (upsert by document ID; both modes\n"
+            "derive the ID from the OCF archive filename)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -457,6 +459,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Index only this tool. Without this flag, all tools are indexed."
+        ),
+    )
+    p_index.add_argument(
+        "--from-archive",
+        dest="from_archive",
+        type=Path,
+        default=None,
+        help=(
+            "Index the OCF documents of this archive directory instead of "
+            "the live session storage. Empty documents are skipped."
+        ),
+    )
+    p_index.add_argument(
+        "--recovered",
+        type=Path,
+        default=None,
+        help=(
+            "With --from-archive: also push the *.meili.json documents in this "
+            "directory verbatim (sessions recovered from an earlier index)."
         ),
     )
     p_index.add_argument(
@@ -858,6 +879,19 @@ def _cmd_index(args: argparse.Namespace) -> int:
     )
     from ocf.renderers.markdown import MarkdownRenderer
 
+    if args.from_archive is not None:
+        if args.watch or args.tool:
+            print("error: --from-archive cannot be combined with --watch or --tool",
+                  file=sys.stderr)
+            return 2
+        if not args.from_archive.is_dir():
+            print(f"error: archive directory not found: {args.from_archive}",
+                  file=sys.stderr)
+            return 2
+    elif args.recovered is not None:
+        print("error: --recovered requires --from-archive", file=sys.stderr)
+        return 2
+
     # Connect
     api_key = args.key or os.environ.get("MEILI_MASTER_KEY") or ""
     try:
@@ -870,6 +904,16 @@ def _cmd_index(args: argparse.Namespace) -> int:
     index_name = args.index_name or DEFAULT_INDEX
     index = ensure_index(client, index_name)
     renderer = MarkdownRenderer(simple=True)
+
+    if args.from_archive is not None:
+        print(f"indexing archive {args.from_archive} into {args.url}/indexes/{index_name}")
+        result = _index_archive(args, index, client, renderer)
+        print(
+            f"{result.indexed} indexed, "
+            f"{result.skipped} skipped (empty), "
+            f"{result.failed} failed"
+        )
+        return 1 if result.failed else 0
 
     # Which tools to index
     if args.tool:
@@ -903,6 +947,54 @@ def _cmd_index(args: argparse.Namespace) -> int:
             f"{result.failed} failed"
         )
         return 1 if result.failed else 0
+
+
+_ARCHIVE_BATCH = 200
+
+
+def _index_archive(args: Any, index: Any, client: Any, renderer: Any) -> Any:
+    """One pass over an OCF archive directory (+ optional recovered docs)."""
+    from ocf.indexers.meilisearch import (
+        IndexResult,
+        index_documents,
+        iter_archive_documents,
+        iter_recovered_documents,
+    )
+
+    result = IndexResult()
+    batch: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        if not batch:
+            return
+        try:
+            index_documents(index, batch, client=client)
+            result.indexed += len(batch)
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: push failed for {len(batch)} documents: {exc}", file=sys.stderr)
+            result.failed += len(batch)
+        batch.clear()
+
+    for path, doc, problem in iter_archive_documents(args.from_archive, renderer.render):
+        if problem == "empty":
+            result.skipped += 1
+            continue
+        if doc is None:
+            print(f"FAILED   {path.name}: {problem}", file=sys.stderr)
+            result.failed += 1
+            continue
+        batch.append(doc)
+        if not args.quiet:
+            print(f"  index  {doc['tool']}: {doc.get('title') or doc['session_id'][:8]}")
+        if len(batch) >= _ARCHIVE_BATCH:
+            flush()
+    if args.recovered is not None:
+        for doc in iter_recovered_documents(args.recovered):
+            batch.append(doc)
+            if not args.quiet:
+                print(f"  index  {doc['tool']} (recovered): {doc.get('title') or doc['id']}")
+    flush()
+    return result
 
 
 def _index_all_tools(
@@ -968,7 +1060,8 @@ def _index_all_tools(
                 result.failed += 1
                 continue
 
-            meili_doc = _make_document(doc, tool_name, rendered)
+            doc_key = tool.adapter.ocf_filename_for(src).removesuffix(".ocf.json")
+            meili_doc = _make_document(doc, tool_name, rendered, doc_key=doc_key)
             tool_docs.append(meili_doc)
 
             # Track state for delta detection

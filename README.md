@@ -27,7 +27,7 @@ Both stages keep a manifest in the output directory, so re-running only re-proce
 | Tool | Source | Notes |
 |---|---|---|
 | Codex | `~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl` | OpenAI Responses-API events. Originator covers Codex CLI, Desktop, and IDE extensions. |
-| Claude Code | `~/.claude/projects/` plus `%APPDATA%/Claude/local-agent-mode-sessions/` (Desktop sub-agents) | Anthropic Messages format with `parentUuid` branching, plus a metadata index for Desktop App titles. |
+| Claude Code | `~/.claude/projects/` plus the Desktop app's `local-agent-mode-sessions/` (Cowork agents; under `%LOCALAPPDATA%/Claude-Data/claude_<hash>/` since 2026-10) | Anthropic Messages format with `parentUuid` branching, plus a metadata index for Desktop App titles. |
 | Cursor | `%APPDATA%/Cursor/User/globalStorage/state.vscdb` (SQLite, ~3 GB) | Read-only via `mode=ro` URI, per-composer fingerprinting, `toolFormerData` extraction (~71% of bubbles carry tool calls). |
 
 Each adapter handles its format's edge cases — NULL bubble values, zombie composer rows, filename collisions across Desktop sub-agent dirs, heartbeat / health-check sessions — and skips them via `SkipExport` so the archive stays clean.
@@ -43,6 +43,10 @@ ocf list <tool> [--source-dir DIR] [--query Q]
 ocf render <input>... [--out DIR] [--format md]
                       [--query Q] [--platform P] [--project P] [--since DATE]
                       [--force] [--dry-run] [--quiet]
+
+ocf index --url URL [--key KEY] [--index-name NAME]
+          --from-archive DIR [--recovered DIR]        # recommended
+ocf index --url URL [--tool T] [--watch] [--interval S]   # live sessions
 ```
 
 `<tool>` is one of `codex`, `claude_code` (alias `claude-code`), `cursor`.
@@ -50,6 +54,10 @@ ocf render <input>... [--out DIR] [--format md]
 `--source` is polymorphic: pass a UUID, a path to a file/directory, or a fuzzy title query.
 
 `ocf render` filters operate on OCF fields, so they work uniformly across all adapters — `--platform cursor`, `--project DerJarl`, `--since 2026-01-01` — and find sessions even after the source storage rotated away.
+
+`ocf index` pushes rendered sessions into Meilisearch (`pip install ocf-py[search]`). With `--from-archive` it reads the OCF archive instead of this machine's live session storage, so the search index mirrors the archive - complete even when several machines feed one shared archive and the tools have long rotated their own session files away. Empty documents are skipped; `--recovered DIR` additionally pushes `*.meili.json` documents saved from an earlier index verbatim. Document IDs derive from the archive filename in both modes, so re-indexing is an idempotent upsert. To rebuild cleanly, index into a fresh `--index-name` and swap it in with Meilisearch's atomic `POST /swap-indexes`.
+
+The recommended recurring pipeline is therefore `ocf export <tool> --out ARCHIVE` for each tool, then `ocf render ARCHIVE --out MD`, then `ocf index --from-archive ARCHIVE`.
 
 Exit codes are cron-friendly: `0` success, `1` partial failure or no matches, `2` user/environment error (missing source dir, invalid date), `130` SIGINT.
 
