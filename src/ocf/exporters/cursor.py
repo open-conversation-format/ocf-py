@@ -69,6 +69,7 @@ from ocf.utils.sqlite_ro import has_table, open_ro
 
 COMPOSER_KEY_PREFIX = "composerData:"
 BUBBLE_KEY_PREFIX = "bubbleId:"
+CONV_HEADERS_KEY_PREFIX = "composerConvHeaders:"
 TOKEN_SEP = "::composerData:"
 
 # Bubble field names we extract (everything else is dropped per
@@ -632,8 +633,12 @@ def _convert_cursor_session(
 
         mrc_workspace = _workspace_from_request_context(conn, composer_id)
 
-    # Order bubbles per fullConversationHeadersOnly when present
-    headers = composer.get("fullConversationHeadersOnly") or []
+        # Order bubbles per fullConversationHeadersOnly when present.
+        # Cursor _v 18 moved them out of composerData into chunked keys
+        # composerConvHeaders:<cid>:<000000..> (same header shape).
+        headers = composer.get("fullConversationHeadersOnly") or []
+        if not headers:
+            headers = _chunked_conversation_headers(conn, composer_id)
     order: list[str] = [
         h.get("bubbleId")
         for h in headers
@@ -651,7 +656,12 @@ def _convert_cursor_session(
                     order.append(bid)
 
     if not order:
+        # No headers at all: the bubble scan yields insertion order, which
+        # drifts when Cursor rewrites a bubble, so createdAt decides.
         order = list(bubbles.keys())
+        created = [bubbles[bid].get("createdAt") for bid in order]
+        if all(isinstance(c, str) and c for c in created):
+            order.sort(key=lambda bid: bubbles[bid]["createdAt"])
 
     # Build conversation block
     composer_v = composer.get("_v")
@@ -1136,6 +1146,29 @@ def _split_path(p: str) -> list[str]:
 def _hash_short(value: str, length: int = 12) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 
+
+
+def _chunked_conversation_headers(conn, composer_id: str) -> list[Any]:
+    """Concatenate ``composerConvHeaders:<cid>:<chunk>`` header lists.
+
+    Chunk suffixes are zero-padded (``000000``, ``000001``, ...), so key
+    order is chunk order. Unparseable chunks are skipped.
+    """
+    rows = conn.execute(
+        "SELECT key, value FROM cursorDiskKV WHERE key LIKE ?",
+        (f"{CONV_HEADERS_KEY_PREFIX}{composer_id}:%",),
+    ).fetchall()
+    headers: list[Any] = []
+    for row in sorted(rows, key=lambda r: r["key"] or ""):
+        if row["value"] is None:
+            continue
+        try:
+            chunk = json.loads(row["value"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(chunk, list):
+            headers.extend(chunk)
+    return headers
 
 
 def _workspace_from_request_context(

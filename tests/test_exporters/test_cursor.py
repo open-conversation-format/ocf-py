@@ -469,6 +469,80 @@ def test_tool_bubble_completed_status_no_explicit_status(
     assert tool_msg.get("status") in (None, "ok")
 
 
+def test_headerless_composer_orders_bubbles_by_created_at(tmp_path: Path) -> None:
+    """Cursor _v 18 drops fullConversationHeadersOnly from composerData.
+
+    Neither key order nor insertion order is chronological here, so
+    only createdAt yields the right sequence.
+    """
+    db = tmp_path / "state.vscdb"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        composer = {"_v": 18, "name": "Headerless", "fullConversationHeadersOnly": []}
+        conn.execute(
+            "INSERT INTO cursorDiskKV VALUES (?, ?)",
+            ("composerData:cid-v18", json.dumps(composer)),
+        )
+        for bid, created, btype, text in (
+            ("b-a", "2026-10-21T10:00:03.000Z", 2, "third"),
+            ("b-b", "2026-10-21T10:00:02.000Z", 2, "second"),
+            ("b-c", "2026-10-21T10:00:01.000Z", 1, "first"),
+        ):
+            bubble = {"_v": 3, "type": btype, "text": text, "createdAt": created}
+            conn.execute(
+                "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                (f"bubbleId:cid-v18:{bid}", json.dumps(bubble)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    doc = export_one(_make_source_token(db, "cid-v18"))
+    texts = [m["message"]["content"] for m in doc["messages"]]
+    assert texts == ["first", "second", "third"]
+
+
+def test_v18_chunked_conversation_headers_drive_order(tmp_path: Path) -> None:
+    """_v 18 keeps headers in composerConvHeaders:<cid>:<chunk> keys.
+
+    Chunks are authoritative for order and selection, exactly like the
+    old inline fullConversationHeadersOnly: a bubble missing from the
+    headers is not part of the conversation.
+    """
+    db = tmp_path / "state.vscdb"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        composer = {"_v": 18, "name": "Chunked", "fullConversationHeadersOnly": []}
+        rows = [("composerData:cid-ch", composer)]
+        # chunk 000001 inserted first: key order, not insertion order, counts
+        rows.append(("composerConvHeaders:cid-ch:000001", [{"bubbleId": "b-2", "type": 2}]))
+        rows.append(("composerConvHeaders:cid-ch:000000", [{"bubbleId": "b-1", "type": 1}]))
+        for bid, created, btype, text in (
+            ("b-1", "2026-10-21T10:00:05.000Z", 1, "question"),
+            ("b-2", "2026-10-21T10:00:01.000Z", 2, "answer"),
+            ("b-x", "2026-10-21T10:00:03.000Z", 2, "not in headers"),
+        ):
+            rows.append(
+                (f"bubbleId:cid-ch:{bid}", {"_v": 3, "type": btype, "text": text, "createdAt": created})
+            )
+        conn.executemany(
+            "INSERT INTO cursorDiskKV VALUES (?, ?)",
+            [(k, json.dumps(v)) for k, v in rows],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    doc = export_one(_make_source_token(db, "cid-ch"))
+    assert [m["message"]["content"] for m in doc["messages"]] == ["question", "answer"]
+
+
 def test_tool_bubble_error_status_propagates(tmp_path: Path) -> None:
     """status='error' -> OCF status='error'."""
     db = tmp_path / "state.vscdb"
