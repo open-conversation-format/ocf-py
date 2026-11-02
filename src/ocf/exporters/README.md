@@ -26,6 +26,7 @@ changes before we notice them in the wild.
 | **Claude Code** | https://github.com/anthropics/claude-code | [Releases](https://github.com/anthropics/claude-code/releases), [CHANGELOG](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | [code.claude.com/docs/en/data-usage](https://code.claude.com/docs/en/data-usage) |
 | **Codex CLI** | https://github.com/openai/codex | [Releases](https://github.com/openai/codex/releases) | Read the repo's `codex-rs/rollout/src/` (incl. `compression.rs`, `rollout_file_name.rs`) and `codex-rs/history/src/` (RolloutItem wire types) |
 | **Cursor IDE** | closed-source | [Changelog](https://cursor.com/changelog) — announces UI features but rarely storage-schema changes; expect to learn about DB changes from the reverse-engineering tools below |
+| **ChatGPT** | closed-source (the 2026 desktop app is the renamed Codex app) | [Release notes](https://help.openai.com/en/articles/6825453-chatgpt-release-notes) | No local history; data only via the official export or the web client's `/backend-api` |
 | **Anthropic SDK** (usage schema source) | https://github.com/anthropics/anthropic-sdk-python | [Releases](https://github.com/anthropics/anthropic-sdk-python/releases) — usage-block field additions land here first (e.g. `cache_read_input_tokens`) |
 
 ## cursor
@@ -85,6 +86,23 @@ reviewed in depth - check them first when a format change is suspected):
 - Structured `toolFormerData` parsing into tool-call / tool-result pairs.
 - Explicit empty-composer skip (`SkipExport`), keeping the archive clean.
 - Per-bubble `modelInfo.modelName` fallback + `messageRequestContext.projectLayouts.absPath` fallback (commit `af797d2`).
+
+## chatgpt
+
+Adapter: [`chatgpt.py`](chatgpt.py). Input: one raw `/backend-api/conversation/<id>` object per file (what pionxzh/chatgpt-exporter writes as "JSON"), loose or in ZIPs.
+
+| Project | URL | Stars | Last reviewed | What it reads | Notable |
+| --- | --- | ---:| --- | --- | --- |
+| **pionxzh / chatgpt-exporter** | https://github.com/pionxzh/chatgpt-exporter ([issues](https://github.com/pionxzh/chatgpt-exporter/issues), [commits](https://github.com/pionxzh/chatgpt-exporter/commits/master)) | 2807 | 2026-11-02 | Web client `/backend-api` from the logged-in session (userscript) | Produces our input files. Only exports the visible branch (`current_node` walk). Citation handling in `utils/citations.ts` (`content_references`, longest `matched_text` first) was the model for ours. Single exports are wrapped in a one-element list. |
+| **mohamed-chs / convoviz** | https://github.com/mohamed-chs/convoviz ([issues](https://github.com/mohamed-chs/convoviz/issues), [commits](https://github.com/mohamed-chs/convoviz/commits/main)) | 888 | 2026-11-02 | Official export ZIP (`conversations.json` / `conversations-NNN.json`) | Hide rules in `message_logic.py:is_message_hidden`. Issue [#70](https://github.com/mohamed-chs/convoviz/issues/70): the Oct 2026 official export drops `children` and adds stray `{}` nodes; we build the tree from `parent` for that reason. |
+| **hoya98 / chatgpt-export** | https://github.com/hoya98/chatgpt-export | 21 | 2026-11-02 | `/backend-api/conversations` paging + per-conversation fetch | Minimal bulk fetcher with backoff; reference for the list/fetch endpoints. |
+| **daugaard47 / ChatGPT_Conversations_To_Markdown** | https://github.com/daugaard47/ChatGPT_Conversations_To_Markdown | 180 | 2026-11-02 | Official export | Do not copy: guesses the branch from leaf timestamps and strips private-use characters only, leaving `citeturn0search1` behind. |
+
+Format notes from 1451 real conversations (2023-2026):
+- `web.run` tool results have empty `parts`; the hits are in `metadata.search_result_groups`.
+- About 700 tool messages have no explicit call (parent is a user, tool or plain assistant message); the adapter synthesizes the call.
+- `reasoning_recap` ("Thought for 6s") is a separate message and is dropped.
+- Images are `file-service://` / `sediment://` pointers that are not part of the export; only tool-generated images arrive inline as `data:` URIs.
 
 ## claude_code
 
