@@ -104,6 +104,36 @@ Format notes from 1451 real conversations (2023-2026):
 - `reasoning_recap` ("Thought for 6s") is a separate message and is dropped.
 - Images are `file-service://` / `sediment://` pointers that are not part of the export; only tool-generated images arrive inline as `data:` URIs.
 
+## claude_ai
+
+Adapter: [`claude_ai.py`](claude_ai.py). Reads the official claude.ai
+data export (Settings > Privacy > Export data,
+[support article](https://support.claude.com/en/articles/9450526-export-your-claude-data)).
+
+Format as of the first export on 2026-11-05: the email links to
+`manifest-<org>-...json` (`version`, `created_at`, `total_files`,
+`data_files[]` with `export_url`, `category`, `part`, `filename`). Each
+`export_url` carries its own token (no login needed), expires 24 h after
+creation and may stop working once used. Categories: `conversations`
+(`conversations.json`), `projects`, `memories`, `frames` (artifacts:
+`artifact.json`, `page.md` / `.html`, `comments.json`) and
+`light_metadata` (`users.json`, `login_history.json`). Only
+`conversations` is read.
+
+`conversations.json` is a list of `{uuid, name, summary, created_at,
+updated_at, account, chat_messages[]}`; a message is `{uuid, text,
+content[], sender: human|assistant, created_at, updated_at,
+attachments[], files[], parent_message_uuid}`, the root parent being
+`00000000-0000-4000-8000-000000000000`. Block types seen: `text`
+(with `citations`), `thinking` (mostly `thinking_hidden` with only
+`summaries`), `tool_use` / `tool_result` (web search and fetch, memory,
+MCP; results hold `text`, `knowledge`, `image`, `local_resource`,
+`image_gallery` items), `image` / `document` (file pointers, no data),
+and `injected_prompt_block` (client-injected context in the human turn:
+date note, memory, tool listings - dropped). No model name is exported.
+Requesting the export must stay a manual click: Consumer Terms section 3
+forbids automated access to claude.ai.
+
 ## claude_code
 
 Adapter: [`claude_code.py`](claude_code.py).

@@ -2,13 +2,13 @@
 
 Reference Python implementation of the [Open Conversation Format (OCF)](https://github.com/open-conversation-format/spec).
 
-**Status: pre-alpha (0.1.0.dev0).** Not on PyPI yet. Built locally and validated against real-world session data from Codex CLI, Claude Code (CLI + Desktop), Cursor IDE and ChatGPT exports before going public.
+**Status: pre-alpha (0.1.0.dev0).** Not on PyPI yet. Built locally and validated against real-world session data from Codex CLI, Claude Code (CLI + Desktop), Cursor IDE, ChatGPT exports and claude.ai exports before going public.
 
 ## What it does
 
 `ocf-py` ships four things you can run today:
 
-1. **Source adapters** that read each tool's session storage and convert it to a wire-strict OCF document - `chatgpt`, `codex`, `claude-code-cli`, `claude-code-app`, `claude-cowork-app`, `cursor`.
+1. **Source adapters** that read each tool's session storage and convert it to a wire-strict OCF document - `chatgpt`, `claude-ai`, `codex`, `claude-code-cli`, `claude-code-app`, `claude-cowork-app`, `cursor`.
 2. **A renderer layer** that turns OCF documents into human-readable Markdown (with YAML front matter for Obsidian / Meilisearch indexing).
 3. **A Meilisearch indexer** that makes the archive full-text searchable.
 4. **An `ocf` CLI** that wires everything into a cron-friendly pipeline. All tools export into one flat archive directory:
@@ -34,6 +34,7 @@ Export and render keep a manifest in the output directory, so re-running only re
 | Codex | `~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl` (zstd-compressed `*.jsonl.zst` after 7 idle days) plus `~/.codex/archived_sessions/` | OpenAI Responses-API events. Originator covers Codex CLI, Desktop, and IDE extensions. Long threads are paginated across several rollout files. |
 | Claude Code | `~/.claude/projects/` plus the Desktop app's `local-agent-mode-sessions/` (Cowork agents; under `%LOCALAPPDATA%/Claude-Data/claude_<hash>/` since 2026-10) | Anthropic Messages format with `parentUuid` branching, plus a metadata index for Desktop App titles. |
 | Cursor | `%APPDATA%/Cursor/User/globalStorage/state.vscdb` (SQLite, ~3 GB) | Read-only via `mode=ro` URI, per-composer fingerprinting, `toolFormerData` extraction (~71% of bubbles carry tool calls). |
+| Claude.ai | The official data export (Settings > Privacy > Export data): `conversations-NNN.zip` with `conversations.json`, read in place; one folder per export | Chats of claude.ai and the Desktop app's "Claude" mode are not stored locally. Full message tree with branches, server-side tool calls and results (web search, MCP), thinking summaries, attachments. |
 | ChatGPT | Export files you downloaded: one `ChatGPT-<title>.json` per conversation, loose or inside ZIPs (pionxzh/chatgpt-exporter "JSON" format, the raw `/backend-api/conversation` response) | ChatGPT keeps no local history, so there is no default location. Full message tree with branches, `recipient`-based tool calls, thinking, citations resolved to links. |
 
 Each adapter handles its format's edge cases — NULL bubble values, zombie composer rows, filename collisions across Desktop sub-agent dirs, heartbeat / health-check sessions — and skips them via `SkipExport` so the archive stays clean.
@@ -48,6 +49,19 @@ export OCF_CHATGPT_EXPORT_DIR=~/Downloads   # several folders: separate with os.
 ```
 
 ZIPs are read in place. Do not extract several export ZIPs into one folder: different conversations share filenames (`ChatGPT-New_chat.json`) and would overwrite each other. Output files are named after the conversation id (`chatgpt-<id>.ocf.json`). OpenAI's official multi-conversation `conversations.json` is not supported yet.
+
+### Claude.ai exports
+
+Chats on claude.ai and in the Desktop app's "Claude" mode live on Anthropic's servers only, so the `claude-ai` adapter reads the official data export. Request it in Settings > Privacy > Export data; the email links to a manifest with one ZIP per category, of which only `conversations-NNN.zip` matters (the others hold projects, memories, artifacts and account metadata). The links expire after 24 hours.
+
+Keep every export in its own dated folder under one root and point the adapter at the root:
+
+```bash
+ocf export claude-ai --source-dir ~/claude-exports --out ./ocf-archive
+export OCF_CLAUDE_AI_EXPORT_DIR=~/claude-exports   # then --source-dir can be omitted
+```
+
+Each export is a full snapshot, so the same conversation appears in every one; the adapter exports each conversation once, from the export with its newest `updated_at`. Keep old exports: a chat deleted on claude.ai is missing from later snapshots but stays exportable from the earlier ones. Images and documents are not part of the export and become placeholders; attachment text (`extracted_content`) is kept as OCF `file` blocks. Output files are named `claude-ai-<uuid>.ocf.json`. Requesting the export is a manual click: Anthropic's Consumer Terms do not allow automated access to claude.ai.
 
 ## CLI reference
 
@@ -66,7 +80,7 @@ ocf index --url URL [--key KEY] [--index-name NAME]
 ocf index --url URL [--tool T] [--watch] [--interval S]   # live sessions
 ```
 
-`<tool>` is one of `chatgpt` (downloaded ChatGPT exports), `claude-code-cli`, `claude-code-app` (Desktop app sessions), `claude-cowork-app` (Desktop background agents), `codex`, `cursor`.
+`<tool>` is one of `chatgpt` (downloaded ChatGPT exports), `claude-ai` (claude.ai data exports), `claude-code-cli`, `claude-code-app` (Desktop app sessions), `claude-cowork-app` (Desktop background agents), `codex`, `cursor`.
 
 `--source` is polymorphic: pass a UUID, a path to a file/directory, or a fuzzy title query.
 
@@ -88,10 +102,14 @@ The archive is the source of truth, not the tools' own storage: Claude Code dele
 for t in claude-code-cli claude-code-app claude-cowork-app codex cursor; do ocf export $t --out ARCHIVE; done
 ```
 
-On the machine that holds the downloaded ChatGPT exports (see "ChatGPT exports" above), add:
+On the machine that holds the downloaded ChatGPT or claude.ai exports (see "ChatGPT exports" and "Claude.ai exports" above), add:
 
 ```bash
 ocf export chatgpt --out ARCHIVE
+```
+
+```bash
+ocf export claude-ai --out ARCHIVE
 ```
 
 Then render and index:
@@ -146,6 +164,7 @@ Clients keep querying `ocf-sessions` throughout. Delete the backup index once th
 | `exporters.claude_code` | Done |
 | `exporters.cursor` | Done |
 | `exporters.chatgpt` | Done |
+| `exporters.claude_ai` | Done |
 | `renderers._base` (Strategy ABC, generic `render_all`) | Done |
 | `renderers.markdown` | Done |
 | `indexers.meilisearch` (live sessions or OCF archive -> Meilisearch) | Done |

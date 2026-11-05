@@ -181,7 +181,7 @@ OCF_SUFFIX = ".ocf.json"
 RECOVERED_SUFFIX = ".meili.json"
 
 # Platform -> facet name where the platform alone is unambiguous.
-_PLATFORM_TOOLS = {"codex": "codex", "cursor": "cursor"}
+_PLATFORM_TOOLS = {"codex": "codex", "cursor": "cursor", "chatgpt": "chatgpt", "claude": "claude-ai"}
 
 
 def archive_tool_name(doc: dict[str, Any], source_path: str | None = None) -> str:

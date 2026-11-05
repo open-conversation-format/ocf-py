@@ -56,6 +56,7 @@ from ocf.exporters._base import (
 )
 from ocf.exporters._common import ExportResult
 from ocf.exporters.chatgpt import ChatGPTAdapter
+from ocf.exporters.claude_ai import ClaudeAiAdapter
 from ocf.exporters.claude_code import (
     ClaudeCodeCliAdapter,
     ClaudeCodeAppAdapter,
@@ -133,6 +134,7 @@ class _AdapterShim:
 # adapter itself (session_info, export_one).
 _TOOLS: dict[str, _AdapterShim] = {
     "chatgpt": _AdapterShim(ChatGPTAdapter()),
+    "claude-ai": _AdapterShim(ClaudeAiAdapter()),
     "codex": _AdapterShim(CodexAdapter()),
     "claude-code-cli": _AdapterShim(ClaudeCodeCliAdapter()),
     "claude-code-app": _AdapterShim(ClaudeCodeAppAdapter()),
@@ -190,7 +192,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="ocf",
         description=(
             "Open Conversation Format toolkit. Convert AI session storage "
-            "(ChatGPT, Codex, Claude Code, Cursor) into portable OCF documents."
+            "(ChatGPT, Claude.ai, Codex, Claude Code, Cursor) into portable OCF documents."
         ),
     )
     parser.add_argument(
