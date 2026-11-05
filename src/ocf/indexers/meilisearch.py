@@ -6,7 +6,7 @@ so any agent (or human) can search across all archived sessions.
 Document schema (per session)::
 
     {
-        "id":         "claude-code-cli__2026-04-26T14-30-00__423b57f7-a078-4e8c-8b41-c72a70ca4652",
+        "id":         "423b57f7-a078-4e8c-8b41-c72a70ca4652",
         "session_id": "423b57f7-a078-4e8c-8b41-c72a70ca4652",
         "tool":       "claude-code-cli",
         "title":      "Research chat export formats",
@@ -17,9 +17,11 @@ Document schema (per session)::
         "content":    "# Research chat export formats\\n\\n..."
     }
 
-The ``id`` encodes tool, datetime, and session UUID so a human can
-read all three at a glance. Collisions across adapters are avoided
-because the tool prefix differs even when UUIDs overlap.
+The ``id`` is the OCF archive filename stem (``<uuid>``,
+``rollout-<ts>-<uuid>``, ``composer-<uuid>``, ``chatgpt-<id>``, ...):
+unique per archive file, so adapters cannot collide, and unchanged
+when a re-export changes the tool label or creation date. Tool and
+date live in their own (filterable) fields.
 
 All write operations are upserts - re-indexing a session that already
 exists just replaces it. This makes the indexer fully idempotent.
@@ -109,9 +111,13 @@ def _make_document(
 ) -> dict[str, Any]:
     """Build a Meilisearch document from an OCF document + rendered text.
 
-    ``doc_key`` (the OCF archive filename stem) replaces the session id
-    in the document ``id`` - unique per archive file even where one
-    session spans several files (Codex history pages, sub-agents).
+    ``doc_key`` (the OCF archive filename stem) is used as the document
+    ``id`` on its own: unique per archive file, even where one session
+    spans several files (Codex history pages, sub-agents), and stable
+    when a document's tool label or creation date changes. Putting those
+    into the id made a re-labelled document land next to its old copy.
+    Without ``doc_key`` the legacy ``<tool>__<datetime>__<session>`` id
+    is built.
     """
     conv = doc.get("conversation", {})
 
@@ -134,8 +140,11 @@ def _make_document(
 
     # Build a human-readable document ID: <tool>__<datetime>__<session_id>
     # Meilisearch IDs allow only alphanumeric, hyphens, underscores.
-    dt_part = f"__{created_datetime}" if created_datetime else ""
-    raw_id = f"{tool_name}{dt_part}__{doc_key or session_id}"
+    if doc_key:
+        raw_id = doc_key
+    else:
+        dt_part = f"__{created_datetime}" if created_datetime else ""
+        raw_id = f"{tool_name}{dt_part}__{session_id}"
     clean_id = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_id)
 
     return {
@@ -243,16 +252,23 @@ def iter_archive_documents(
         yield path, _make_document(doc, tool, rendered, doc_key=key), None
 
 
-def iter_recovered_documents(recovered_dir: Path) -> Iterator[dict[str, Any]]:
+def iter_recovered_documents(
+    recovered_dir: Path, *, skip_sessions: set[str] | frozenset[str] = frozenset()
+) -> Iterator[dict[str, Any]]:
     """Index documents saved verbatim from an earlier index (``*.meili.json``).
 
     For sessions whose source and OCF document no longer exist anywhere,
     the old index copy is the only content left; it is pushed unchanged.
+    Sessions in ``skip_sessions`` (already covered by an archive document,
+    e.g. because another machine still had the source) are left out.
     """
     for path in sorted(Path(recovered_dir).glob("*" + RECOVERED_SUFFIX)):
         doc = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(doc, dict) and doc.get("id") and doc.get("content"):
-            yield doc
+        if not (isinstance(doc, dict) and doc.get("id") and doc.get("content")):
+            continue
+        if doc.get("session_id") in skip_sessions:
+            continue
+        yield doc
 
 
 def ensure_index(

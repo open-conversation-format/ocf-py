@@ -69,17 +69,37 @@ def test_iter_archive_documents(tmp_path: Path) -> None:
     session_doc, problem = out[f"{SID}.ocf.json"]
     assert problem is None
     assert session_doc["tool"] == "claude-code"
-    assert session_doc["id"] == f"claude-code__2026-04-26T10-00-05__{SID}"
+    assert session_doc["id"] == SID
+    assert session_doc["created_date"] == "2026-04-26"
     assert session_doc["session_id"] == SID
     assert "Hello" in session_doc["content"]
 
     agent_doc, _ = out["agent-a1b2.ocf.json"]
     assert agent_doc["tool"] == "claude-cowork-app"
-    assert agent_doc["id"].endswith("__agent-a1b2")
+    assert agent_doc["id"] == "agent-a1b2"
 
     assert out["empty.ocf.json"] == (None, "empty")
     assert out["broken.ocf.json"][0] is None
     assert out["broken.ocf.json"][1].startswith("unreadable")
+
+
+def test_relabelled_document_keeps_its_id(tmp_path: Path) -> None:
+    """A re-export that adds the source_adapter label must upsert the same
+    document instead of creating a second one next to it."""
+    archive = tmp_path / "ocf-archive"
+    archive.mkdir()
+    doc = _ocf(_session_jsonl(tmp_path / "src" / f"{SID}.jsonl"))
+    target = archive / f"{SID}.ocf.json"
+    render = MarkdownRenderer(simple=True).render
+
+    target.write_text(json.dumps(doc), encoding="utf-8")
+    (_, before, _), = iter_archive_documents(archive, render)
+    doc["conversation"]["meta"]["ocf_py"] = {"source_adapter": "claude-code-app"}
+    target.write_text(json.dumps(doc), encoding="utf-8")
+    (_, after, _), = iter_archive_documents(archive, render)
+
+    assert (before["tool"], after["tool"]) == ("claude-code", "claude-code-app")
+    assert before["id"] == after["id"] == SID
 
 
 def test_iter_recovered_documents(tmp_path: Path) -> None:
@@ -89,6 +109,8 @@ def test_iter_recovered_documents(tmp_path: Path) -> None:
     (tmp_path / "abc.md").write_text("---\n---\n", encoding="utf-8")
     (tmp_path / "bad.meili.json").write_text(json.dumps({"id": "x"}), encoding="utf-8")
     assert list(iter_recovered_documents(tmp_path)) == [good]
+    # once the archive holds the session again, the recovered copy is left out
+    assert list(iter_recovered_documents(tmp_path, skip_sessions={"abc"})) == []
 
 
 def test_export_all_records_source_adapter(tmp_path: Path) -> None:

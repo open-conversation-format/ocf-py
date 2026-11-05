@@ -965,6 +965,7 @@ def _index_archive(args: Any, index: Any, client: Any, renderer: Any) -> Any:
 
     result = IndexResult()
     batch: list[dict[str, Any]] = []
+    archived_sessions: set[str] = set()
 
     def flush() -> None:
         if not batch:
@@ -986,12 +987,13 @@ def _index_archive(args: Any, index: Any, client: Any, renderer: Any) -> Any:
             result.failed += 1
             continue
         batch.append(doc)
+        archived_sessions.add(doc["session_id"])
         if not args.quiet:
             print(f"  index  {doc['tool']}: {doc.get('title') or doc['session_id'][:8]}")
         if len(batch) >= _ARCHIVE_BATCH:
             flush()
     if args.recovered is not None:
-        for doc in iter_recovered_documents(args.recovered):
+        for doc in iter_recovered_documents(args.recovered, skip_sessions=archived_sessions):
             batch.append(doc)
             if not args.quiet:
                 print(f"  index  {doc['tool']} (recovered): {doc.get('title') or doc['id']}")
