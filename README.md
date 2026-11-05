@@ -88,6 +88,14 @@ The archive is the source of truth, not the tools' own storage: Claude Code dele
 for t in claude-code-cli claude-code-app claude-cowork-app codex cursor; do ocf export $t --out ARCHIVE; done
 ```
 
+On the machine that holds the downloaded ChatGPT exports (see "ChatGPT exports" above), add:
+
+```bash
+ocf export chatgpt --out ARCHIVE
+```
+
+Then render and index:
+
 ```bash
 ocf render ARCHIVE --out ARCHIVE-md
 ```

@@ -140,7 +140,10 @@ blocks. Deliberately ignored as telemetry / UI state: `attachment`,
 `queue-operation`, `last-prompt`, `mode`, `permission-mode`,
 `atis-latch`, `agent-name`, `cost-state`, `file-history-snapshot`,
 `file-history-delta`, `bridge-session`, `relocated`, `frame-link`,
-`teleported-from`, `summary` (legacy), and the request-logging trio
+`teleported-from`, `summary` (legacy), `tools-used` (tool name list),
+`artifact-comment-monitor` and `artifact-autoreact-ledger` (artifact
+UI state; all three new in 2.1.31x, census 2026-11-05), and the
+request-logging trio
 `api-request`, `api-request-shape`, `api-request-blob` (these carry
 `message` payloads with system prompts - never treat them as turns).
 Sessions that yield no messages at all (e.g. summary-only stub files:
@@ -209,7 +212,9 @@ Storage changes seen with Codex Desktop's bundled 0.163 (2026-10; the
   `author`/`recipient`; none on the maintainer's machine so far).
 - New ignored event types: `world_state`, `token_usage_record`,
   `compacted` (its `replacement_history` duplicates earlier items),
-  `response_item:additional_tools`. Titles still come from
+  `response_item:additional_tools`, and since 0.165 also
+  `response_item:compaction` (only `encrypted_content`, unreadable).
+  Titles still come from
   `~/.codex/session_index.jsonl`; `state_5.sqlite` (`threads` table)
   holds the same titles plus `rollout_path`.
 
