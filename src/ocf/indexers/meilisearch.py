@@ -3,28 +3,59 @@
 Pushes rendered session content + metadata into a Meilisearch index
 so any agent (or human) can search across all archived sessions.
 
-Document schema (per session)::
+Sessions are split into chunks
+------------------------------
+Meilisearch indexes at most 65,535 word positions per attribute and
+silently ignores the rest, so the late part of a long session - the
+part you need to pick up where it ended - would not be searchable as
+one document. Each session is therefore split into chunks of at most
+``CHUNK_WORDS`` words / ``CHUNK_CHARS`` characters, cut at message
+boundaries, one index document per chunk. Search with
+``distinct: "doc"`` for one hit per session;
+filter ``doc = <key>`` to search inside one session; fetch
+``<key>__c<n-1>`` / ``<key>__c<n+1>`` to page backwards and forwards.
+Every chunk also carries the size of the whole session, so an agent
+can decide from the hit alone whether to read step by step or load
+the whole archive file.
+
+Document schema (per chunk)::
 
     {
-        "id":         "423b57f7-a078-4e8c-8b41-c72a70ca4652",
-        "session_id": "423b57f7-a078-4e8c-8b41-c72a70ca4652",
-        "tool":       "claude-code-cli",
-        "title":      "Research chat export formats",
-        "project":    "OpenChatFormat",
-        "model":      "claude-opus-4-6",
-        "created_at": 1714089600,         # unix timestamp (filterable)
-        "created_date": "2026-04-26",     # human-readable
-        "content":    "# Research chat export formats\\n\\n..."
+        "id":            "423b57f7-a078-4e8c-8b41-c72a70ca4652__c3",
+        "doc":           "423b57f7-a078-4e8c-8b41-c72a70ca4652",  # archive file stem
+        "session_id":    "423b57f7-a078-4e8c-8b41-c72a70ca4652",
+        "tool":          "claude-code-cli",
+        "title":         "Research chat export formats",
+        "project":       "OpenChatFormat",
+        "model":         "claude-opus-4-6",
+        "created_at":    1714089600,      # session start (unix, filterable)
+        "created_date":  "2026-04-26",
+        "updated_at":    1714262400,      # last activity of the session
+        "updated_date":  "2026-04-28",
+        "chunk":         3,               # 1-based position ...
+        "chunks":        5,               # ... of this many
+        "msg_from":      410,             # index range in the OCF document's
+        "msg_to":        633,             # "messages" (inclusive)
+        "chunk_from":    1714150000,      # time range of the chunk (unix)
+        "chunk_to":      1714170000,
+        "words":         3980,            # words in this chunk
+        "session_words": 18200,           # whole session (dialog text)
+        "session_chars": 121000,
+        "session_messages": 1490,         # OCF messages incl. tool calls
+        "archive_bytes": 2400000,         # size of the OCF file, if known
+        "content":       "**User**\\n\\n..."
     }
 
-The ``id`` is the OCF archive filename stem (``<uuid>``,
+``doc`` is the OCF archive filename stem (``<uuid>``,
 ``rollout-<ts>-<uuid>``, ``composer-<uuid>``, ``chatgpt-<id>``, ...):
 unique per archive file, so adapters cannot collide, and unchanged
 when a re-export changes the tool label or creation date. Tool and
-date live in their own (filterable) fields.
+dates live in their own (filterable) fields.
 
 All write operations are upserts - re-indexing a session that already
-exists just replaces it. This makes the indexer fully idempotent.
+exists just replaces its chunks. A session that shrinks to fewer chunks
+leaves its old trailing chunks behind; rebuild into a fresh index when
+that matters.
 """
 
 from __future__ import annotations
@@ -32,11 +63,13 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from ocf.renderers.markdown import simple_message_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +80,35 @@ _FILTERABLE_ATTRIBUTES = [
     "model",
     "created_at",
     "created_date",
+    "updated_at",
+    "updated_date",
+    "doc",
+    "session_id",
+    "chunk",
+    "chunk_from",
+    "chunk_to",
 ]
 
 _SORTABLE_ATTRIBUTES = [
     "created_at",
+    "updated_at",
+    "chunk",
+    "chunk_from",
 ]
 
 # Default index name
 DEFAULT_INDEX = "ocf-sessions"
+
+# Chunk size: whichever limit is hit first. Small enough that one chunk
+# fits a single tool output (about 30,000 characters) and far below
+# Meilisearch's position limit. The character limit matters for code
+# and URL heavy text, where 4,000 words can be 80,000+ characters.
+CHUNK_WORDS = 4000
+CHUNK_CHARS = 24000
+
+# Messages already start with a speaker label (**User** / **Claude**), so
+# a blank line separates them without adding countable words.
+CHUNK_SEPARATOR = "\n\n"
 
 # Meilisearch's default wait_for_task timeout is 5000ms — too short for
 # batches over ~200 docs or when the server is under load. Give tasks
@@ -66,11 +120,12 @@ _TASK_TIMEOUT_MS = 300_000
 
 @dataclass
 class IndexResult:
-    """Summary of an index run."""
+    """Summary of an index run (``indexed`` counts sessions)."""
 
     indexed: int = 0
     skipped: int = 0
     failed: int = 0
+    chunks: int = 0
 
 
 _UUID_RE = re.compile(
@@ -102,62 +157,176 @@ def _extract_session_id(conv: dict[str, Any]) -> str:
     return sid
 
 
-def _make_document(
-    doc: dict[str, Any],
-    tool_name: str,
-    rendered_content: str,
-    *,
-    doc_key: str | None = None,
-) -> dict[str, Any]:
-    """Build a Meilisearch document from an OCF document + rendered text.
+def _clean_id(raw: str) -> str:
+    """Meilisearch ids allow only alphanumerics, hyphens and underscores."""
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", raw)
 
-    ``doc_key`` (the OCF archive filename stem) is used as the document
-    ``id`` on its own: unique per archive file, even where one session
-    spans several files (Codex history pages, sub-agents), and stable
-    when a document's tool label or creation date changes. Putting those
-    into the id made a re-labelled document land next to its old copy.
-    Without ``doc_key`` the legacy ``<tool>__<datetime>__<session>`` id
-    is built.
-    """
+
+def _ts(value: Any) -> int:
+    if not isinstance(value, str) or not value:
+        return 0
+    try:
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except (ValueError, OSError):
+        return 0
+
+
+def _date(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d") if ts else ""
+
+
+def _session_fields(doc: dict[str, Any], tool_name: str) -> dict[str, Any]:
+    """Fields shared by every chunk of one session."""
     conv = doc.get("conversation", {})
-
-    session_id = _extract_session_id(conv)
-
-    created_at_str = conv.get("created_at")
-    created_ts: int = 0
-    created_date: str = ""
-    created_datetime: str = ""
-    if created_at_str:
-        try:
-            dt = datetime.fromisoformat(
-                created_at_str.replace("Z", "+00:00")
-            )
-            created_ts = int(dt.timestamp())
-            created_date = dt.strftime("%Y-%m-%d")
-            created_datetime = dt.strftime("%Y-%m-%dT%H-%M-%S")
-        except (ValueError, OSError):
-            pass
-
-    # Build a human-readable document ID: <tool>__<datetime>__<session_id>
-    # Meilisearch IDs allow only alphanumeric, hyphens, underscores.
-    if doc_key:
-        raw_id = doc_key
-    else:
-        dt_part = f"__{created_datetime}" if created_datetime else ""
-        raw_id = f"{tool_name}{dt_part}__{session_id}"
-    clean_id = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_id)
-
+    messages = doc.get("messages") or []
+    created = _ts(conv.get("created_at"))
+    updated = _ts(conv.get("updated_at")) or max(
+        (_ts(m.get("created_at")) for m in messages), default=0
+    ) or created
     return {
-        "id": clean_id,
-        "session_id": session_id,
+        "session_id": _extract_session_id(conv),
         "tool": tool_name,
         "title": conv.get("title") or "",
         "project": _extract_project(conv),
         "model": conv.get("default_model") or "",
-        "created_at": created_ts,
-        "created_date": created_date,
-        "content": rendered_content,
+        "created_at": created,
+        "created_date": _date(created),
+        "updated_at": updated,
+        "updated_date": _date(updated),
+        "session_messages": len(messages),
     }
+
+
+def _split_line(line: str, words_limit: int, chars_limit: int) -> list[str]:
+    """Split one overlong line at spaces; giant tokens (blobs) by characters."""
+    out: list[str] = []
+    buf: list[str] = []
+    words = chars = 0
+    for tok in line.split():
+        while len(tok) > chars_limit:
+            if buf:
+                out.append(" ".join(buf))
+                buf, words, chars = [], 0, 0
+            out.append(tok[:chars_limit])
+            tok = tok[chars_limit:]
+        if not tok:
+            continue
+        if buf and (words + 1 > words_limit or chars + len(tok) + 1 > chars_limit):
+            out.append(" ".join(buf))
+            buf, words, chars = [], 0, 0
+        buf.append(tok)
+        words += 1
+        chars += len(tok) + 1
+    if buf:
+        out.append(" ".join(buf))
+    return out
+
+
+def _split_long_block(
+    text: str, words_limit: int = CHUNK_WORDS, chars_limit: int = CHUNK_CHARS
+) -> list[str]:
+    """Split one oversized message at line breaks, spaces as a last resort."""
+    pieces: list[str] = []
+    current: list[str] = []
+    words = chars = 0
+    for line in text.split("\n"):
+        lw, lc = len(line.split()), len(line) + 1
+        if lw > words_limit or lc > chars_limit:
+            if current:
+                pieces.append("\n".join(current))
+                current, words, chars = [], 0, 0
+            pieces.extend(_split_line(line, words_limit, chars_limit))
+            continue
+        if current and (words + lw > words_limit or chars + lc > chars_limit):
+            pieces.append("\n".join(current))
+            current, words, chars = [], 0, 0
+        current.append(line)
+        words += lw
+        chars += lc
+    if current:
+        pieces.append("\n".join(current))
+    return pieces
+
+
+def chunk_blocks(
+    blocks: list[tuple[int, str]],
+    words_limit: int = CHUNK_WORDS,
+    chars_limit: int = CHUNK_CHARS,
+) -> list[tuple[int | None, int | None, str]]:
+    """Group ``(message index, text)`` blocks into ``(msg_from, msg_to, text)``.
+
+    Cuts only between messages; a single message over either limit is
+    split into pieces of its own. Always returns at least one (possibly
+    empty) chunk, so a session without dialog text stays findable by
+    title and project.
+    """
+    chunks: list[tuple[int | None, int | None, str]] = []
+    parts: list[str] = []
+    first: int | None = None
+    last: int | None = None
+    words = chars = 0
+
+    def flush() -> None:
+        nonlocal parts, first, last, words, chars
+        if parts:
+            chunks.append((first, last, CHUNK_SEPARATOR.join(parts)))
+        parts, first, last, words, chars = [], None, None, 0, 0
+
+    for idx, text in blocks:
+        bw, bc = len(text.split()), len(text) + len(CHUNK_SEPARATOR)
+        if bw > words_limit or bc > chars_limit:
+            flush()
+            chunks.extend(
+                (idx, idx, piece) for piece in _split_long_block(text, words_limit, chars_limit)
+            )
+            continue
+        if parts and (words + bw > words_limit or chars + bc > chars_limit):
+            flush()
+        if first is None:
+            first = idx
+        last = idx
+        parts.append(text)
+        words += bw
+        chars += bc
+    flush()
+    return chunks or [(None, None, "")]
+
+
+def make_chunk_documents(
+    doc: dict[str, Any],
+    tool_name: str,
+    *,
+    doc_key: str,
+    archive_bytes: int | None = None,
+    chunk_words: int = CHUNK_WORDS,
+    chunk_chars: int = CHUNK_CHARS,
+) -> list[dict[str, Any]]:
+    """Build the index documents (one per chunk) for one OCF document."""
+    base = _session_fields(doc, tool_name)
+    blocks = simple_message_blocks(doc)
+    base["session_words"] = sum(len(text.split()) for _, text in blocks)
+    base["session_chars"] = sum(len(text) for _, text in blocks)
+    if archive_bytes is not None:
+        base["archive_bytes"] = archive_bytes
+    messages = doc.get("messages") or []
+    chunks = chunk_blocks(blocks, chunk_words, chunk_chars)
+    out: list[dict[str, Any]] = []
+    for n, (lo, hi, text) in enumerate(chunks, 1):
+        entry = {
+            **base,
+            "id": _clean_id(f"{doc_key}__c{n}"),
+            "doc": doc_key,
+            "chunk": n,
+            "chunks": len(chunks),
+            "msg_from": lo,
+            "msg_to": hi,
+            "chunk_from": _ts(messages[lo].get("created_at")) if lo is not None else base["created_at"],
+            "chunk_to": _ts(messages[hi].get("created_at")) if hi is not None else base["updated_at"],
+            "words": len(text.split()),
+            "content": text,
+        }
+        out.append(entry)
+    return out
 
 
 def _extract_project(conv: dict[str, Any]) -> str:
@@ -222,20 +391,20 @@ def load_archive_provenance(archive_dir: Path) -> dict[str, str]:
 
 
 def iter_archive_documents(
-    archive_dir: Path,
-    render: Callable[[dict[str, Any]], str],
-) -> Iterator[tuple[Path, dict[str, Any] | None, str | None]]:
-    """Yield ``(ocf_path, meili_doc, problem)`` for every archived OCF file.
+    archive_dir: Path, *, chunk_words: int = CHUNK_WORDS, chunk_chars: int = CHUNK_CHARS
+) -> Iterator[tuple[Path, list[dict[str, Any]] | None, str | None]]:
+    """Yield ``(ocf_path, chunk_docs, problem)`` for every archived OCF file.
 
     ``problem`` is ``None`` for an indexable document, ``"empty"`` for a
     document without messages (skipped, never indexed), or an error
-    description (``meili_doc`` is then ``None``).
+    description (``chunk_docs`` is then ``None``).
     """
     archive_dir = Path(archive_dir)
     provenance = load_archive_provenance(archive_dir)
     for path in sorted(archive_dir.rglob("*" + OCF_SUFFIX)):
         try:
-            doc = json.loads(path.read_bytes())
+            raw = path.read_bytes()
+            doc = json.loads(raw)
         except (OSError, json.JSONDecodeError) as exc:
             yield path, None, f"unreadable: {exc}"
             continue
@@ -243,32 +412,67 @@ def iter_archive_documents(
             yield path, None, "empty"
             continue
         try:
-            rendered = render(doc)
+            tool = archive_tool_name(doc, provenance.get(path.name))
+            key = path.name[: -len(OCF_SUFFIX)]
+            chunks = make_chunk_documents(
+                doc, tool, doc_key=key, archive_bytes=len(raw),
+                chunk_words=chunk_words, chunk_chars=chunk_chars,
+            )
         except Exception as exc:  # noqa: BLE001
             yield path, None, f"render failed: {exc}"
             continue
-        tool = archive_tool_name(doc, provenance.get(path.name))
-        key = path.name[: -len(OCF_SUFFIX)]
-        yield path, _make_document(doc, tool, rendered, doc_key=key), None
+        yield path, chunks, None
 
 
 def iter_recovered_documents(
-    recovered_dir: Path, *, skip_sessions: set[str] | frozenset[str] = frozenset()
-) -> Iterator[dict[str, Any]]:
-    """Index documents saved verbatim from an earlier index (``*.meili.json``).
+    recovered_dir: Path,
+    *,
+    skip_sessions: set[str] | frozenset[str] = frozenset(),
+    chunk_words: int = CHUNK_WORDS,
+    chunk_chars: int = CHUNK_CHARS,
+) -> Iterator[list[dict[str, Any]]]:
+    """Chunk documents saved verbatim from an earlier index (``*.meili.json``).
 
     For sessions whose source and OCF document no longer exist anywhere,
-    the old index copy is the only content left; it is pushed unchanged.
-    Sessions in ``skip_sessions`` (already covered by an archive document,
-    e.g. because another machine still had the source) are left out.
+    the old index copy is the only content left. Its metadata is kept
+    and its text split like any other session; ``doc`` is the session
+    id, which is also the file name in the recovered folder. Sessions in
+    ``skip_sessions`` (already covered by an archive document, e.g.
+    because another machine still had the source) are left out.
     """
     for path in sorted(Path(recovered_dir).glob("*" + RECOVERED_SUFFIX)):
-        doc = json.loads(path.read_text(encoding="utf-8"))
-        if not (isinstance(doc, dict) and doc.get("id") and doc.get("content")):
+        old = json.loads(path.read_text(encoding="utf-8"))
+        if not (isinstance(old, dict) and old.get("id") and old.get("content")):
             continue
-        if doc.get("session_id") in skip_sessions:
+        sid = str(old.get("session_id") or path.name[: -len(RECOVERED_SUFFIX)])
+        if sid in skip_sessions:
             continue
-        yield doc
+        pieces = _split_long_block(old["content"], chunk_words, chunk_chars) or [""]
+        created = int(old.get("created_at") or 0)
+        base = {
+            key: old[key] for key in ("tool", "title", "project", "model") if key in old
+        }
+        base.update(
+            session_id=sid, doc=sid, created_at=created, created_date=_date(created),
+            updated_at=created, updated_date=_date(created), session_messages=0,
+            session_words=len(old["content"].split()), session_chars=len(old["content"]),
+            recovered=True,
+        )
+        yield [
+            {
+                **base,
+                "id": _clean_id(f"{sid}__c{n}"),
+                "chunk": n,
+                "chunks": len(pieces),
+                "msg_from": None,
+                "msg_to": None,
+                "chunk_from": created,
+                "chunk_to": created,
+                "words": len(piece.split()),
+                "content": piece,
+            }
+            for n, piece in enumerate(pieces, 1)
+        ]
 
 
 def ensure_index(
@@ -313,6 +517,28 @@ def index_documents(
     return total
 
 
+def enqueue_documents(index: Any, documents: list[dict[str, Any]]) -> int:
+    """Enqueue one document batch without waiting; returns the task uid.
+
+    Meilisearch merges consecutive enqueued additions into large internal
+    batches, so enqueueing everything first and waiting once at the end
+    (:func:`wait_for_tasks`) is far faster than waiting per batch.
+    """
+    return index.add_documents(documents).task_uid
+
+
+def wait_for_tasks(client: Any, task_uids: list[int]) -> dict[int, str]:
+    """Wait for enqueued tasks; return ``{task uid: error}`` for failed ones."""
+    failed: dict[int, str] = {}
+    for uid in task_uids:
+        task = client.wait_for_task(uid, timeout_in_ms=_TASK_TIMEOUT_MS)
+        if getattr(task, "status", "succeeded") != "succeeded":
+            error = getattr(task, "error", None) or {}
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            failed[uid] = f"{getattr(task, 'status', '?')}: {message or 'no details'}"
+    return failed
+
+
 def search(
     index: Any,
     query: str,
@@ -320,8 +546,12 @@ def search(
     tool: str | None = None,
     project: str | None = None,
     limit: int = 10,
+    per_session: bool = True,
 ) -> list[dict[str, Any]]:
-    """Search the index with optional facet filters."""
+    """Search the index with optional facet filters.
+
+    ``per_session`` returns only the best chunk of each session.
+    """
     filters: list[str] = []
     if tool:
         filters.append(f'tool = "{tool}"')
@@ -329,6 +559,8 @@ def search(
         filters.append(f'project = "{project}"')
 
     params: dict[str, Any] = {"limit": limit}
+    if per_session:
+        params["distinct"] = "doc"
     if filters:
         params["filter"] = " AND ".join(filters)
 

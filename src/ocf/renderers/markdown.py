@@ -180,13 +180,7 @@ class MarkdownRenderer(Renderer):
         )
 
         # ----- Messages -----
-        assistant_label = _ASSISTANT_LABEL.get(platform, "Assistant")
-        messages = doc.get("messages") or []
-        rendered_blocks: list[str] = []
-        for env in messages:
-            block = _simple_envelope(env, assistant_label=assistant_label)
-            if block is not None:
-                rendered_blocks.append(block)
+        rendered_blocks = [block for _, block in simple_message_blocks(doc)]
 
         if not rendered_blocks:
             buf.write("---\n\n_(no conversation content)_\n")
@@ -453,6 +447,23 @@ def _render_envelope(env: dict[str, Any], *, default_model: str | None) -> str:
     return out.getvalue()
 
 
+def simple_message_blocks(doc: dict[str, Any]) -> list[tuple[int, str]]:
+    """``(message index, block)`` for every message the simple profile shows.
+
+    The index points into ``doc["messages"]``, so a consumer that splits
+    the rendering (the search indexer) can map each piece back to its
+    messages in the OCF document.
+    """
+    platform = ((doc.get("conversation") or {}).get("source") or {}).get("platform") or "unknown"
+    assistant_label = _ASSISTANT_LABEL.get(platform, "Assistant")
+    out: list[tuple[int, str]] = []
+    for i, env in enumerate(doc.get("messages") or []):
+        block = _simple_envelope(env, assistant_label=assistant_label)
+        if block is not None:
+            out.append((i, block))
+    return out
+
+
 def _simple_envelope(
     env: dict[str, Any], *, assistant_label: str
 ) -> str | None:
@@ -611,4 +622,4 @@ def _escape_md_inline(s: str) -> str:
     return _MD_INLINE_ESCAPES.sub(r"\\\1", s)
 
 
-__all__ = ["MarkdownRenderer"]
+__all__ = ["MarkdownRenderer", "simple_message_blocks"]

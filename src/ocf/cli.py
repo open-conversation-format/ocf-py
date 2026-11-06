@@ -874,14 +874,7 @@ def _cmd_index(args: argparse.Namespace) -> int:
         )
         return 2
 
-    from ocf.indexers.meilisearch import (
-        DEFAULT_INDEX,
-        IndexResult,
-        _make_document,
-        ensure_index,
-        index_documents,
-    )
-    from ocf.renderers.markdown import MarkdownRenderer
+    from ocf.indexers.meilisearch import DEFAULT_INDEX, ensure_index
 
     if args.from_archive is not None:
         if args.watch or args.tool:
@@ -907,13 +900,12 @@ def _cmd_index(args: argparse.Namespace) -> int:
 
     index_name = args.index_name or DEFAULT_INDEX
     index = ensure_index(client, index_name)
-    renderer = MarkdownRenderer(simple=True)
 
     if args.from_archive is not None:
         print(f"indexing archive {args.from_archive} into {args.url}/indexes/{index_name}")
-        result = _index_archive(args, index, client, renderer)
+        result = _index_archive(args, index, client)
         print(
-            f"{result.indexed} indexed, "
+            f"{result.indexed} sessions indexed as {result.chunks} chunks, "
             f"{result.skipped} skipped (empty), "
             f"{result.failed} failed"
         )
@@ -932,21 +924,21 @@ def _cmd_index(args: argparse.Namespace) -> int:
         known: dict[str, tuple[float, int]] = {}
         while True:
             result = _index_all_tools(
-                tools, index, client, renderer, args, known_state=known
+                tools, index, client, args, known_state=known
             )
             if result.indexed > 0 and not args.quiet:
                 print(
                     f"[{time.strftime('%H:%M:%S')}] "
-                    f"+{result.indexed} indexed, "
+                    f"+{result.indexed} sessions ({result.chunks} chunks) indexed, "
                     f"{result.skipped} unchanged, "
                     f"{result.failed} failed"
                 )
             time.sleep(args.interval)
     else:
         print(f"indexing into {args.url}/indexes/{index_name}")
-        result = _index_all_tools(tools, index, client, renderer, args)
+        result = _index_all_tools(tools, index, client, args)
         print(
-            f"{result.indexed} indexed, "
+            f"{result.indexed} sessions indexed as {result.chunks} chunks, "
             f"{result.skipped} skipped, "
             f"{result.failed} failed"
         )
@@ -956,50 +948,70 @@ def _cmd_index(args: argparse.Namespace) -> int:
 _ARCHIVE_BATCH = 200
 
 
-def _index_archive(args: Any, index: Any, client: Any, renderer: Any) -> Any:
+def _index_archive(args: Any, index: Any, client: Any) -> Any:
     """One pass over an OCF archive directory (+ optional recovered docs)."""
     from ocf.indexers.meilisearch import (
         IndexResult,
-        index_documents,
+        enqueue_documents,
         iter_archive_documents,
         iter_recovered_documents,
+        wait_for_tasks,
     )
 
     result = IndexResult()
     batch: list[dict[str, Any]] = []
+    pending_sessions = 0
     archived_sessions: set[str] = set()
+    # task uid -> (sessions, chunks) it carries; resolved once at the end
+    enqueued: dict[int, tuple[int, int]] = {}
 
     def flush() -> None:
+        nonlocal pending_sessions
         if not batch:
             return
         try:
-            index_documents(index, batch, client=client)
-            result.indexed += len(batch)
+            enqueued[enqueue_documents(index, list(batch))] = (pending_sessions, len(batch))
         except Exception as exc:  # noqa: BLE001
-            print(f"error: push failed for {len(batch)} documents: {exc}", file=sys.stderr)
-            result.failed += len(batch)
+            print(f"error: push failed for {pending_sessions} sessions: {exc}", file=sys.stderr)
+            result.failed += pending_sessions
         batch.clear()
+        pending_sessions = 0
 
-    for path, doc, problem in iter_archive_documents(args.from_archive, renderer.render):
+    def add(chunks: list[dict[str, Any]], label: str) -> None:
+        nonlocal pending_sessions
+        batch.extend(chunks)
+        pending_sessions += 1
+        if not args.quiet:
+            head = chunks[0]
+            print(f"  index  {head['tool']}{label}: {head.get('title') or head['doc'][:8]}"
+                  f" ({len(chunks)} chunk{'s' if len(chunks) != 1 else ''})")
+        if len(batch) >= _ARCHIVE_BATCH:
+            flush()
+
+    for path, chunks, problem in iter_archive_documents(args.from_archive):
         if problem == "empty":
             result.skipped += 1
             continue
-        if doc is None:
+        if chunks is None:
             print(f"FAILED   {path.name}: {problem}", file=sys.stderr)
             result.failed += 1
             continue
-        batch.append(doc)
-        archived_sessions.add(doc["session_id"])
-        if not args.quiet:
-            print(f"  index  {doc['tool']}: {doc.get('title') or doc['session_id'][:8]}")
-        if len(batch) >= _ARCHIVE_BATCH:
-            flush()
+        archived_sessions.add(chunks[0]["session_id"])
+        add(chunks, "")
     if args.recovered is not None:
-        for doc in iter_recovered_documents(args.recovered, skip_sessions=archived_sessions):
-            batch.append(doc)
-            if not args.quiet:
-                print(f"  index  {doc['tool']} (recovered): {doc.get('title') or doc['id']}")
+        for chunks in iter_recovered_documents(args.recovered, skip_sessions=archived_sessions):
+            add(chunks, " (recovered)")
     flush()
+    if not args.quiet:
+        print(f"waiting for Meilisearch to apply {len(enqueued)} batches ...")
+    failed = wait_for_tasks(client, list(enqueued))
+    for uid, (sessions, chunk_count) in enqueued.items():
+        if uid in failed:
+            print(f"error: batch {uid} ({sessions} sessions) {failed[uid]}", file=sys.stderr)
+            result.failed += sessions
+        else:
+            result.indexed += sessions
+            result.chunks += chunk_count
     return result
 
 
@@ -1007,13 +1019,12 @@ def _index_all_tools(
     tools: dict[str, _AdapterShim],
     index: Any,
     client: Any,
-    renderer: Any,
     args: Any,
     *,
     known_state: dict[str, tuple[float, int]] | None = None,
 ) -> Any:
     """Run one indexing pass across all selected tools."""
-    from ocf.indexers.meilisearch import IndexResult, _make_document, index_documents
+    from ocf.indexers.meilisearch import IndexResult, index_documents, make_chunk_documents
 
     result = IndexResult()
 
@@ -1024,6 +1035,7 @@ def _index_all_tools(
             continue
 
         tool_docs: list[dict[str, Any]] = []
+        tool_sessions = 0
 
         for src in sources:
             src_key = str(src)
@@ -1040,7 +1052,7 @@ def _index_all_tools(
                     result.skipped += 1
                     continue
 
-            # Export + render + build document
+            # Export + build the chunk documents
             try:
                 doc = tool.adapter.export_one(src, validate=False)
             except SkipExport:
@@ -1059,16 +1071,15 @@ def _index_all_tools(
                 continue
 
             try:
-                rendered = renderer.render(doc)
+                doc_key = tool.adapter.ocf_filename_for(src).removesuffix(".ocf.json")
+                chunks = make_chunk_documents(doc, tool_name, doc_key=doc_key)
             except Exception as exc:
                 if not args.quiet:
                     print(f"FAILED   {src.name} (render): {exc}", file=sys.stderr)
                 result.failed += 1
                 continue
-
-            doc_key = tool.adapter.ocf_filename_for(src).removesuffix(".ocf.json")
-            meili_doc = _make_document(doc, tool_name, rendered, doc_key=doc_key)
-            tool_docs.append(meili_doc)
+            tool_docs.extend(chunks)
+            tool_sessions += 1
 
             # Track state for delta detection
             if known_state is not None:
@@ -1079,20 +1090,21 @@ def _index_all_tools(
                     pass
 
             if not args.quiet:
-                title = meili_doc.get("title") or meili_doc["session_id"][:8]
-                print(f"  index  {tool_name}: {title}")
+                title = chunks[0].get("title") or chunks[0]["session_id"][:8]
+                print(f"  index  {tool_name}: {title} ({len(chunks)} chunks)")
 
         # Push per tool so one bad document doesn't kill the whole batch
         if tool_docs:
             try:
                 index_documents(index, tool_docs, client=client)
-                result.indexed += len(tool_docs)
+                result.indexed += tool_sessions
+                result.chunks += len(tool_docs)
             except Exception as exc:
                 print(
                     f"error: push failed for {tool_name}: {exc}",
                     file=sys.stderr,
                 )
-                result.failed += len(tool_docs)
+                result.failed += tool_sessions
 
     return result
 
