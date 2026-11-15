@@ -172,7 +172,8 @@ blocks. Deliberately ignored as telemetry / UI state: `attachment`,
 `file-history-delta`, `bridge-session`, `relocated`, `frame-link`,
 `teleported-from`, `summary` (legacy), `tools-used` (tool name list),
 `artifact-comment-monitor` and `artifact-autoreact-ledger` (artifact
-UI state; all three new in 2.1.31x, census 2026-11-05), and the
+UI state; all three new in 2.1.31x, census 2026-11-05), `session-owner`
+(account / organization ids; new in 2.1.32x, census 2026-11-15), and the
 request-logging trio
 `api-request`, `api-request-shape`, `api-request-blob` (these carry
 `message` payloads with system prompts - never treat them as turns).
@@ -256,6 +257,13 @@ Storage changes seen with Codex Desktop's bundled 0.163 (2026-10; the
 
 Recurring format-check (do this maybe once a month, or after a Cursor /
 Claude Code update lands on your machine):
+
+0. **Local census first.** `uv run python scripts/format_census.py`
+   scans this machine's Claude Code, Codex and Cursor storage and lists
+   the raw types outside the known lists (converted or deliberately
+   ignored, as documented above). For each one, decide whether an
+   adapter must convert it or it is metadata to ignore, then update the
+   adapter or the ignored list here and the lists in the script.
 
 1. **Upstream releases first.** Skim the release notes for the three
    upstream repos in the top table — anthropics/claude-code,
