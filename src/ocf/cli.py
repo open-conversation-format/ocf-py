@@ -163,6 +163,14 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_index(args)
         if args.command == "watch":
             return _cmd_watch(args)
+        if args.command == "sync":
+            from ocf.sync.cli import cmd_sync
+
+            return cmd_sync(args)
+        if args.command == "app":
+            from ocf.sync.cli import cmd_app
+
+            return cmd_app(args)
     except FileNotFoundError as exc:
         # Missing source directory is a user/environment problem, not a bug.
         print(f"error: {exc}", file=sys.stderr)
@@ -532,6 +540,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Plain stdout instead of the Rich live UI (cron-friendly).",
     )
+
+    # ---- sync / app ---------------------------------------------------
+    from ocf.sync.cli import add_parsers as _add_sync_parsers
+
+    _add_sync_parsers(sub, _TOOL_CHOICES)
 
     return parser
 

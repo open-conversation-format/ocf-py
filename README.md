@@ -78,6 +78,11 @@ ocf render <input>... [--out DIR] [--format md]
 ocf index --url URL [--key KEY] [--index-name NAME]
           --from-archive DIR [--recovered DIR]        # recommended
 ocf index --url URL [--tool T] [--watch] [--interval S]   # live sessions
+
+ocf sync [--archive DIR] [--md DIR] [--url URL] [--key KEY] [--index-name NAME]
+         [--tools T...] [--interval S] [--quiet-period S] [--max-delay S]
+         [--save] [--once | --status]
+ocf app  [same settings] [--show] [--autostart on|off]
 ```
 
 `<tool>` is one of `chatgpt` (downloaded ChatGPT exports), `claude-ai` (claude.ai data exports), `claude-code-cli`, `claude-code-app` (Desktop app sessions), `claude-cowork-app` (Desktop background agents), `codex`, `cursor`.
@@ -90,6 +95,8 @@ ocf index --url URL [--tool T] [--watch] [--interval S]   # live sessions
 
 Each session is split into chunks of at most 4,000 words / 24,000 characters, cut at message boundaries, one index document per chunk: Meilisearch only indexes the first 65,535 word positions of a field, which would hide the late part of long sessions. Every chunk carries `doc` (the archive filename stem), `chunk` / `chunks` (position), `msg_from` / `msg_to` (message range in the OCF document), `chunk_from` / `chunk_to` (time range), `updated_at` (last activity of the session) and the size of the whole session (`session_messages`, `session_words`, `session_chars`, `archive_bytes`), so a reader can choose between paging through chunks and loading the whole archive file. Search with `"distinct": "doc"` for one hit per session, filter `doc = "<stem>"` to search inside one session, and read neighbours by `chunk`. Chunk ids are `<stem>__c<n>` in both modes, so re-indexing is an idempotent upsert; a session that shrinks leaves its trailing chunks behind until the next rebuild. To rebuild cleanly, index into a fresh `--index-name` and swap it in with Meilisearch's atomic `POST /swap-indexes`.
 
+`ocf sync` does export, render and index continuously, see "Continuous sync" below. `ocf app` runs the same with a tray icon and an activity window (`pip install ocf-py[app]`).
+
 Exit codes are cron-friendly: `0` success, `1` partial failure or no matches, `2` user/environment error (missing source dir, invalid date), `130` SIGINT.
 
 ## Running it across several machines
@@ -98,7 +105,40 @@ The archive is the source of truth, not the tools' own storage: Claude Code dele
 
 **One shared archive.** Point every machine at the same archive directory (e.g. a folder on a synced cloud drive) and keep it flat: one `ocf-archive/` for all tools, no per-tool subfolders, one `ocf-archive-md/` next to it. OCF filenames are unique per session, so documents from different machines and tools coexist; the renderer writes all Markdown into one directory, so a session filed twice in different subfolders would overwrite its own Markdown.
 
-**Recurring run**, on any machine:
+**Continuous sync** (recommended). Install the app extra and start the app; on first start it opens its settings (archive, Markdown folder, Meilisearch URL, index and API key):
+
+```bash
+uv sync --extra app
+```
+
+```bash
+ocf app --show
+```
+
+"Start at login" in the window (or `ocf app --autostart on`) adds it to the Windows Startup folder. The settings are stored locally (`%LOCALAPPDATA%\ocf\sync-settings.json`, `~/.local/state/ocf/` elsewhere); the API key goes into the system credential store (Windows Credential Manager), never into a file. Without a key the sync still archives and renders, warns, and skips indexing; the skipped sessions are remembered and indexed as soon as a key is set. Without the app, the same setup on the command line:
+
+```bash
+ocf sync --archive ARCHIVE --md ARCHIVE-md --url URL --key KEY --save
+```
+
+The key is looked up in this order: `--key` for the current run, the credential store, `MEILI_MASTER_KEY`. The app's "Test connection" checks URL and key before saving.
+
+Or headless, in a terminal or as a service: `ocf sync`. For a single catch-up round that exports, renders and indexes everything that changed and then exits: `ocf sync --once`.
+
+How it behaves:
+
+- It scans this machine's session storage every 15 s (`--interval`). Cursor's database is only scanned when its files changed, and at most every 2 minutes.
+- A changed session is written once it has been quiet for 90 s (`--quiet-period`), so one write per pause instead of one per message; a session that never pauses is written at least every 10 minutes (`--max-delay`). "Sync now" in the app, or a new start, writes everything at once.
+- Each write exports the session, renders its Markdown and replaces its chunks in the index. Results identical to the archived file are not written again, so the synced folder does not upload them.
+- Export and render manifests live in the local state directory, one per machine and archive; the first start copies the shared `.ocf-manifest.json` / `.ocf-render-manifest.json` there, so sessions archived before stay skipped. Several machines can therefore sync into one archive at the same time.
+- Each machine keeps `ARCHIVE/.ocf-machines/<machine>.json` up to date: state, last write, the last sessions written, its ocf-py commit and how many commits it is behind. The app shows these under "Machines"; agents reading the archive can see from it how current each machine is.
+- If the index is unreachable, written sessions wait in a backlog and are indexed on the next successful attempt (retried every minute). If the archive is unreachable (cloud drive not mounted), nothing is written until it is back.
+- Once an hour it fetches the ocf-py remote and reports new commits; after a `git pull` it asks for a restart. It never updates itself.
+- Large sessions are uploaded whole by most sync clients on every write; raise `--max-delay` and `--quiet-period` if that is too much traffic.
+
+The activity log and the app's log file are in the local state directory ("Log folder" in the app).
+
+**Manual run**, on any machine without `ocf sync`:
 
 ```bash
 for t in claude-code-cli claude-code-app claude-cowork-app codex cursor; do ocf export $t --out ARCHIVE; done
@@ -128,7 +168,7 @@ Rules that keep the archive and the index consistent:
 
 - **Same version everywhere.** Pull before exporting or indexing. An older ocf-py misses newer storage formats (e.g. compressed Codex rollouts, the Claude Desktop data move of 2026-10) and labels documents differently.
 - **Index only from the archive.** The live mode (`ocf index` without `--from-archive`) only sees the sessions currently on that one machine; with several machines it lets the index drift from the archive.
-- **One exporter at a time.** The export manifest is rewritten as a whole, so two machines exporting into the same archive at once can lose each other's manifest entries.
+- **One manual exporter at a time.** `ocf export` and `ocf render` rewrite the shared manifests in the archive as a whole, so two machines running them at once can lose each other's manifest entries (the cost is only repeated work). `ocf sync` keeps its manifests locally and is not affected; it runs alongside manual runs and other machines' syncs.
 - **Re-export with `--force` after converter fixes.** The manifest only notices changed sources; a fixed adapter does not re-convert unchanged sessions on its own. Render and index pick up the changed documents automatically.
 - **Check formats after tool updates.** Unknown event or block types are ignored silently, so a plain export cannot reveal them. Before the first run after a tool update, run `uv run python scripts/format_census.py`: it lists every raw type in this machine's session files that the adapters neither convert nor deliberately ignore (exit code 1 if there is one). See [`src/ocf/exporters/README.md`](src/ocf/exporters/README.md) for the current inventory and upstream sources.
 
@@ -170,7 +210,9 @@ Clients keep querying `ocf-sessions` throughout. Delete the backup index once th
 | `renderers._base` (Strategy ABC, generic `render_all`) | Done |
 | `renderers.markdown` | Done |
 | `indexers.meilisearch` (live sessions or OCF archive -> Meilisearch) | Done |
-| `cli` (`export`, `list`, `render`, `index`, `watch`) | Done |
+| `sync` (continuous export/render/index, per-machine manifests, machine status files) | Done |
+| `sync.app` (tray icon + activity window, tkinter/pystray) | Done |
+| `cli` (`export`, `list`, `render`, `index`, `watch`, `sync`, `app`) | Done |
 | `core.strip_to_wire` (OCF -> Chat Completions wire form) | Planned |
 | `core.redaction` | Planned |
 | `core.bundle` (multi-doc archives with shared resources) | Planned |

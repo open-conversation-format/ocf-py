@@ -208,6 +208,18 @@ class SourceAdapter(ABC):
         stat = source.stat()
         return (stat.st_mtime_ns, stat.st_size, sha256_file(source))
 
+    def change_marker(self) -> Any:
+        """Cheap value that changes whenever any source may have changed.
+
+        ``ocf sync`` polls every few seconds. For adapters whose
+        discovery or fingerprinting is expensive (Cursor reads every
+        composer from a large SQLite database), it compares this marker
+        first and skips the scan while it stays the same. ``None`` means
+        "no cheap marker, always scan" (the default; stat-ing session
+        files is cheap enough).
+        """
+        return None
+
     def ocf_filename_for(self, source: Path) -> str:
         """Map a source to its OCF output filename.
 
@@ -387,6 +399,8 @@ def export_all(
     source_dirs: list[Path] | Path | None = None,
     force: bool = False,
     dry_run: bool = False,
+    manifest_dir: Path | None = None,
+    skip_identical: bool = False,
 ) -> ExportResult:
     """Generic bulk-export runner — works for any :class:`SourceAdapter`.
 
@@ -398,6 +412,12 @@ def export_all(
     The manifest, skip-detection (mtime+size, then sha256), atomic
     write, validation, and failure collection are identical across
     all adapters and live here.
+
+    ``manifest_dir`` keeps the manifest somewhere other than ``out_dir``
+    (``ocf sync`` keeps one per machine outside the shared archive).
+    ``skip_identical`` leaves an OCF file untouched when the new export
+    is byte-identical to it, so a synced folder does not upload it again;
+    such sources count as skipped.
     """
     if sources is not None:
         rollout_files = [Path(s) for s in sources]
@@ -406,7 +426,8 @@ def export_all(
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    manifest = load_manifest(out_dir)
+    manifest_dir = Path(manifest_dir) if manifest_dir is not None else out_dir
+    manifest = load_manifest(manifest_dir)
     result = ExportResult(out_dir=out_dir if not dry_run else None)
 
     for src in rollout_files:
@@ -470,10 +491,6 @@ def export_all(
                     result.updated.append(src)
                 continue
 
-            tmp = ocf_path.with_suffix(ocf_path.suffix + ".tmp")
-            tmp.write_bytes(ocf_bytes)
-            os.replace(tmp, ocf_path)
-
             new_entry = ManifestEntry(
                 source_path=str(src),
                 source_mtime_ns=mtime_ns,
@@ -483,6 +500,14 @@ def export_all(
                 ocf_sha256=ocf_hash,
                 exported_at=_now_iso(),
             )
+            if skip_identical and same_file_bytes(ocf_path, ocf_bytes):
+                manifest.set_entry(src, new_entry)
+                result.skipped.append(src)
+                continue
+
+            tmp = ocf_path.with_suffix(ocf_path.suffix + ".tmp")
+            tmp.write_bytes(ocf_bytes)
+            os.replace(tmp, ocf_path)
             manifest.set_entry(src, new_entry)
 
             if entry is None:
@@ -493,9 +518,19 @@ def export_all(
             result.failed.append((src, f"{type(exc).__name__}: {exc}"))
 
     if not dry_run:
-        save_manifest(out_dir, manifest)
+        save_manifest(manifest_dir, manifest)
 
     return result
+
+
+def same_file_bytes(path: Path, data: bytes) -> bool:
+    """True if ``path`` exists and holds exactly ``data``."""
+    try:
+        if path.stat().st_size != len(data):
+            return False
+        return path.read_bytes() == data
+    except OSError:
+        return False
 
 
 def _ocf_filename_for(source: Path) -> str:

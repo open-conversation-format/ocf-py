@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ocf.core.canonical import sha256_hex
+from ocf.exporters._base import same_file_bytes
 from ocf.exporters._common import ExportResult
 from ocf.exporters._manifest import (
     Manifest,
@@ -218,6 +219,8 @@ def render_all(
     sources: Iterable[Path],
     force: bool = False,
     dry_run: bool = False,
+    manifest_dir: Path | None = None,
+    skip_identical: bool = False,
 ) -> ExportResult:
     """Render each OCF document in ``sources`` to ``out_dir``.
 
@@ -225,11 +228,13 @@ def render_all(
     keyed on (mtime, size, sha256), atomic writes via .tmp+rename, all
     failures collected without aborting the whole run. The result is
     an :class:`ExportResult` (re-used for symmetry; "new/updated/skipped"
-    semantics carry over).
+    semantics carry over). ``manifest_dir`` and ``skip_identical`` work
+    as in :func:`ocf.exporters._base.export_all`.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    manifest = _load_render_manifest(out_dir)
+    manifest_dir = Path(manifest_dir) if manifest_dir is not None else out_dir
+    manifest = _load_render_manifest(manifest_dir)
     result = ExportResult(out_dir=out_dir if not dry_run else None)
 
     for src in sources:
@@ -258,10 +263,6 @@ def render_all(
                     result.updated.append(src)
                 continue
 
-            tmp = output_path.with_suffix(output_path.suffix + ".tmp")
-            tmp.write_bytes(output_bytes)
-            os.replace(tmp, output_path)
-
             new_entry = ManifestEntry(
                 source_path=str(src),
                 source_mtime_ns=mtime_ns,
@@ -271,6 +272,14 @@ def render_all(
                 ocf_sha256=output_hash,
                 exported_at=_now_iso(),
             )
+            if skip_identical and same_file_bytes(output_path, output_bytes):
+                manifest.set_entry(src, new_entry)
+                result.skipped.append(src)
+                continue
+
+            tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+            tmp.write_bytes(output_bytes)
+            os.replace(tmp, output_path)
             manifest.set_entry(src, new_entry)
 
             if entry is None:
@@ -281,7 +290,7 @@ def render_all(
             result.failed.append((src, f"{type(exc).__name__}: {exc}"))
 
     if not dry_run:
-        _save_render_manifest(out_dir, manifest)
+        _save_render_manifest(manifest_dir, manifest)
     return result
 
 

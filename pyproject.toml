@@ -28,11 +28,18 @@ dependencies = [
 
 [project.optional-dependencies]
 search = [
+    "keyring>=25.7.0",
     "meilisearch>=0.31",
 ]
 dev = [
     "pytest>=8",
     "pytest-cov>=5",
+]
+app = [
+    "keyring>=25.7.0",
+    "meilisearch>=0.31",
+    "pillow>=10",
+    "pystray>=0.19",
 ]
 
 [project.scripts]

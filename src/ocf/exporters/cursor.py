@@ -313,6 +313,27 @@ class CursorAdapter(SourceAdapter):
         # composer UUIDs are themselves filesystem-safe on all platforms
         return f"composer-{composer_id}.ocf.json"
 
+    def change_marker(self) -> Any:
+        """Size and mtime of every ``state.vscdb`` and its WAL file.
+
+        Cursor writes into the WAL first and checkpoints into the main
+        file later, so both are part of the marker.
+        """
+        marker = []
+        for d in self.default_source_dirs():
+            try:
+                dbs = sorted(d.rglob(self.rollout_glob))
+            except OSError:
+                continue
+            for db in dbs:
+                for path in (db, db.with_name(db.name + "-wal")):
+                    try:
+                        st = path.stat()
+                    except OSError:
+                        continue
+                    marker.append((str(path), st.st_mtime_ns, st.st_size))
+        return tuple(marker)
+
     def source_fingerprint(self, source: Path) -> tuple[int, int, str]:
         """Per-composer fingerprint over composerData + its bubble rows.
 
