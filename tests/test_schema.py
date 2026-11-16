@@ -13,6 +13,7 @@ Two layers:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -30,11 +31,11 @@ from ocf.core.schema import (
 )
 
 
-# Local path convention: spec repo lives next to ocf-py during dev.
-# Resolved relative to this test file's location.
+# Local path convention: the spec repo is checked out next to ocf-py
+# (open-conversation-format/spec and open-conversation-format/ocf-py).
+# OCF_SPEC_DIR overrides it for other layouts.
 SPEC_EXAMPLES_DIR = (
-    Path(__file__).parent.parent.parent.parent
-    / "OpenChatFormat"
+    Path(os.environ.get("OCF_SPEC_DIR") or Path(__file__).parent.parent.parent / "spec")
     / "examples"
 ).resolve()
 
@@ -102,7 +103,7 @@ def test_spec_examples_dir_found() -> None:
     """
     assert SPEC_EXAMPLES_DIR.exists(), (
         f"Cannot find spec examples at {SPEC_EXAMPLES_DIR}. "
-        "Adjust SPEC_EXAMPLES_DIR in test_schema.py for your local layout."
+        "Check out the spec repo next to ocf-py or set OCF_SPEC_DIR."
     )
 
 
