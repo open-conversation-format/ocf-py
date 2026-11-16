@@ -92,6 +92,27 @@ def _git(repo: Path, *args: str, timeout: float = 30.0) -> str | None:
     return out.stdout.strip() if out.returncode == 0 else None
 
 
+def code_fingerprint() -> str:
+    """Hash over the ``ocf`` package's Python sources on disk.
+
+    Changes when a pull or a local edit changed the code, not when only
+    the commit changed (committing the running code needs no restart).
+    """
+    import hashlib
+
+    import ocf
+
+    root = Path(ocf.__file__).resolve().parent
+    h = hashlib.sha1()
+    for path in sorted(root.rglob("*.py")):
+        try:
+            h.update(path.relative_to(root).as_posix().encode())
+            h.update(path.read_bytes())
+        except OSError:
+            continue
+    return h.hexdigest()
+
+
 def git_head(repo: Path | None) -> str | None:
     return _git(repo, "rev-parse", "--short", "HEAD") if repo else None
 

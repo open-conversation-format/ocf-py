@@ -110,6 +110,7 @@ class _AdapterShim:
         source_dir: list[Path] | Path | None = None,
         force: bool = False,
         dry_run: bool = False,
+        keep_newer: bool = False,
     ) -> ExportResult:
         if sources is None and source_dir is not None:
             dirs = source_dir if isinstance(source_dir, list) else [source_dir]
@@ -125,6 +126,7 @@ class _AdapterShim:
             source_dirs=source_dir,
             force=force,
             dry_run=dry_run,
+            keep_newer=keep_newer,
         )
 
 
@@ -563,6 +565,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
             source_dir=source_dir,
             force=args.force,
             dry_run=args.dry_run,
+            keep_newer=not args.force,
         )
     else:
         sources = module.resolve_sources(args.source, source_dir=source_dir)
@@ -579,6 +582,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
             sources=sources,
             force=args.force,
             dry_run=args.dry_run,
+            keep_newer=not args.force,
         )
 
     if not args.quiet:
@@ -588,6 +592,9 @@ def _cmd_export(args: argparse.Namespace) -> int:
             print(f"updated  {src}")
         for src in result.skipped:
             print(f"skipped  {src}")
+
+    for src, reason in result.kept_newer:
+        print(f"kept     {src}: not overwritten, {reason} (--force overwrites)")
 
     if args.dry_run:
         print(f"[dry-run] {result.summary()}")

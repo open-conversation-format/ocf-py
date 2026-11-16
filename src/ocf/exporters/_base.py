@@ -208,6 +208,19 @@ class SourceAdapter(ABC):
         stat = source.stat()
         return (stat.st_mtime_ns, stat.st_size, sha256_file(source))
 
+    def refresh(self) -> None:
+        """Forget cached tool metadata before a new scan.
+
+        Adapters cache metadata indexes per instance (``_index_cache``:
+        Claude Desktop's session list, Codex's ``session_index.jsonl``).
+        A long-running ``ocf sync`` calls this before every scan, so a
+        session created after the start is classified and titled like
+        one that existed before.
+        """
+        cache = getattr(self, "_index_cache", None)
+        if isinstance(cache, dict):
+            cache.clear()
+
     def change_marker(self) -> Any:
         """Cheap value that changes whenever any source may have changed.
 
@@ -401,6 +414,7 @@ def export_all(
     dry_run: bool = False,
     manifest_dir: Path | None = None,
     skip_identical: bool = False,
+    keep_newer: bool = False,
 ) -> ExportResult:
     """Generic bulk-export runner — works for any :class:`SourceAdapter`.
 
@@ -418,6 +432,13 @@ def export_all(
     ``skip_identical`` leaves an OCF file untouched when the new export
     is byte-identical to it, so a synced folder does not upload it again;
     such sources count as skipped.
+
+    ``keep_newer`` protects a shared archive: when the same session file
+    exists on several machines (copied home directory, a session resumed
+    on another machine), the copies diverge, and the archive must keep
+    the most advanced one. An existing OCF document whose last message is
+    later (or equally late with more messages) is not overwritten; the
+    source lands in ``kept_newer`` and ``skipped``.
     """
     if sources is not None:
         rollout_files = [Path(s) for s in sources]
@@ -504,6 +525,13 @@ def export_all(
                 manifest.set_entry(src, new_entry)
                 result.skipped.append(src)
                 continue
+            if keep_newer:
+                reason = archived_is_newer(doc, ocf_path)
+                if reason:
+                    manifest.set_entry(src, new_entry)
+                    result.kept_newer.append((src, reason))
+                    result.skipped.append(src)
+                    continue
 
             tmp = ocf_path.with_suffix(ocf_path.suffix + ".tmp")
             tmp.write_bytes(ocf_bytes)
@@ -521,6 +549,43 @@ def export_all(
         save_manifest(manifest_dir, manifest)
 
     return result
+
+
+def _message_extent(doc: dict[str, Any]) -> tuple[float, int]:
+    """(timestamp of the latest message, number of messages)."""
+    latest = 0.0
+    messages = doc.get("messages") or []
+    for env in messages:
+        raw = env.get("created_at") if isinstance(env, dict) else None
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        latest = max(latest, ts)
+    return latest, len(messages)
+
+
+def archived_is_newer(doc: dict[str, Any], ocf_path: Path) -> str | None:
+    """Reason text if ``ocf_path`` holds a more advanced state of ``doc``'s
+    session (later last message, or as late with more messages)."""
+    try:
+        import json
+
+        archived = json.loads(ocf_path.read_bytes())
+    except (OSError, ValueError):
+        return None
+    new_last, new_count = _message_extent(doc)
+    old_last, old_count = _message_extent(archived)
+    if (old_last, old_count) <= (new_last, new_count):
+        return None
+
+    def when(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if ts else "?"
+
+    return (f"archive has {old_count:,} messages up to {when(old_last)} UTC, "
+            f"this copy {new_count:,} up to {when(new_last)} UTC")
 
 
 def same_file_bytes(path: Path, data: bytes) -> bool:

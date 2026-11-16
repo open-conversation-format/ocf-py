@@ -207,6 +207,10 @@ class SyncApp:
         self.state_images = {s: ImageTk.PhotoImage(status_icon(s, 40)) for s in COLORS}
         self.state_label = ttk.Label(head, image=self.state_images["starting"])
         self.state_label.pack(side="left", padx=(0, 12))
+        # Buttons are packed before the text block so they keep their space
+        # when the window gets narrow; the text is clipped instead.
+        buttons = ttk.Frame(head)
+        buttons.pack(side="right", anchor="n")
         text = ttk.Frame(head)
         text.pack(side="left", fill="x", expand=True)
         ttk.Label(text, text=APP_NAME, font=title_font).pack(anchor="w")
@@ -215,8 +219,6 @@ class SyncApp:
         self.facts_var = tk.StringVar(value="")
         ttk.Label(text, textvariable=self.facts_var, foreground="#555").pack(anchor="w")
 
-        buttons = ttk.Frame(head)
-        buttons.pack(side="right")
         self.pause_button = ttk.Button(buttons, text="Pause", command=self.toggle_pause, width=11)
         self.pause_button.pack(side="right", padx=(6, 0))
         ttk.Button(buttons, text="Sync now", command=self.sync_now, width=11).pack(side="right")
@@ -282,6 +284,7 @@ class SyncApp:
         if sys.platform == "win32":
             ttk.Checkbutton(foot, text="Start at login", variable=self.autostart_var,
                             command=self._toggle_autostart).pack(side="left", padx=(16, 0))
+        ttk.Button(foot, text="Quit", command=self.quit).pack(side="right", padx=(12, 0))
         ttk.Button(foot, text="Log folder", command=lambda: self._open(state_root())).pack(side="right")
         if self.config.archive_md:
             ttk.Button(foot, text="Markdown folder",
@@ -468,7 +471,18 @@ class SyncApp:
         self._refresh_machines()
 
     def hide(self) -> None:
+        """Close the window; the sync keeps running in the tray."""
         self.root.withdraw()
+        if not self._told_about_tray:
+            self._told_about_tray = True
+            try:
+                self.icon.notify("OCF Sync keeps running in the notification area. "
+                                 "Quit it from the tray menu or with Quit in the window.",
+                                 APP_NAME)
+            except Exception:  # noqa: BLE001
+                pass
+
+    _told_about_tray = False
 
     def sync_now(self) -> None:
         self.wake_event.set()
@@ -813,6 +827,11 @@ def run_app(config: SyncConfig, *, show: bool = False) -> int:
         return 1
     try:
         app = SyncApp(config, show=show)
+        # In a terminal (--foreground), Ctrl+C quits cleanly: the engine
+        # finishes its round and marks this machine as stopped.
+        import signal
+
+        signal.signal(signal.SIGINT, lambda *_: app.inbox.put(("call", app.quit)))
         return app.run()
     except Exception:
         logger.exception("app crashed")

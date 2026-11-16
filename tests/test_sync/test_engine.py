@@ -334,3 +334,69 @@ def test_pusher_upserts_chunks_and_trims_the_rest(tmp_path: Path) -> None:
     assert index.added[0]["id"] == f"{SID_A}__c1"
     assert index.added[0]["tool"] == "claude-code-cli"
     assert index.filters == [f'(doc = "{SID_A}" AND chunk > 1)']
+
+
+def test_older_copy_from_this_machine_does_not_overwrite_the_archive(tmp_path: Path) -> None:
+    """Same session file on two machines; the other one continued it."""
+    s = _Setup(tmp_path, quiet=30)
+    # The other machine archived the session with 3 turns ...
+    other = _Adapter(tmp_path / "other", tmp_path / "meta")
+    _write_session(tmp_path / "other" / "p" / f"{SID_A}.jsonl", 3)
+    from ocf.exporters._base import export_all
+
+    export_all(other, s.archive, manifest_dir=tmp_path / "other-state")
+    archived = (s.archive / f"{SID_A}.ocf.json").read_bytes()
+
+    # ... this machine still has the older 2-turn copy.
+    s.session(SID_A, 2)
+    assert s.tick() == []
+    assert (s.archive / f"{SID_A}.ocf.json").read_bytes() == archived
+    (kept,) = [a for a in s.seen if a.kind == "warning"]
+    assert "Kept the newer archive version" in kept.message
+    assert "6 messages" in kept.detail and "4 up to" in kept.detail
+
+    # Continued here beyond the archived state: written again.
+    s.session(SID_A, 4)
+    s.tick(5)
+    written = s.tick(40)
+    assert [(a.kind, a.doc) for a in written] == [("updated", SID_A)]
+    assert "8 messages" in written[0].detail
+
+
+def test_session_reclassified_while_running_gets_the_new_label(tmp_path: Path) -> None:
+    """A Desktop fork shows up in Claude Desktop's metadata after its file."""
+    owned: set[str] = set()  # session ids in the (fake) Desktop metadata
+
+    class _Cli(_Adapter):
+        name = "fake_cli"
+
+        def discover(self, source_dirs=None):
+            return [p for p in super().discover(source_dirs) if p.stem not in owned]
+
+    class _App(_Adapter):
+        name = "fake_app"
+        refreshed = 0
+
+        def refresh(self) -> None:
+            type(self).refreshed += 1
+
+        def discover(self, source_dirs=None):
+            return [p for p in super().discover(source_dirs) if p.stem in owned]
+
+    s = _Setup(tmp_path, quiet=30)
+    s.engine.adapters = {
+        "fake-cli": _Cli(tmp_path / "projects", tmp_path / "meta"),
+        "fake-app": _App(tmp_path / "projects", tmp_path / "meta"),
+    }
+    s.session(SID_A, 1)
+    s.tick()
+    label = lambda: json.loads((s.archive / f"{SID_A}.ocf.json").read_text(encoding="utf-8"))[  # noqa: E731
+        "conversation"]["meta"]["ocf_py"]["source_adapter"]
+    assert label() == "fake-cli"
+
+    owned.add(SID_A)  # the metadata appears; the file itself is unchanged
+    s.tick(5)
+    written = s.tick(40)
+    assert [(a.kind, a.tool) for a in written] == [("updated", "fake-app")]
+    assert label() == "fake-app"
+    assert _App.refreshed >= 3  # once per scan

@@ -37,6 +37,7 @@ from typing import Any
 
 from ocf import __version__
 from ocf.exporters._base import SourceAdapter, export_all
+from ocf.exporters._common import ExportResult
 from ocf.exporters._manifest import MANIFEST_FILENAME
 from ocf.renderers._base import _RENDER_MANIFEST_NAME, Renderer, render_all
 from ocf.sync import system
@@ -161,6 +162,9 @@ class Pending:
     first_change: float
     last_change: float
     title: str = ""
+    reconvert: bool = False
+    """New to this tool's scan (e.g. reclassified from CLI to Desktop):
+    export without the manifest's skip, so its labels are current."""
 
     def due_at(self, quiet: float, max_delay: float) -> float:
         return min(self.last_change + quiet, self.first_change + max_delay)
@@ -246,6 +250,7 @@ class SyncEngine:
         self._last_scan: dict[str, float] = {}
         self._pending: dict[tuple[str, str], Pending] = {}
         self._catchup: dict[str, list[Path]] = {}
+        self._reconvert: set[str] = set()
         self._index_backlog: dict[Path, None] = self._load_backlog()
         self._next_index_retry = 0.0
         self._seeded = False
@@ -260,6 +265,7 @@ class SyncEngine:
 
         self._repo = system.repo_root() if check_updates else None
         self.status.running_head = system.git_head(self._repo)
+        self._code_at_start = system.code_fingerprint() if self._repo else ""
         self._next_update_check = 0.0 if self._repo else math.inf
 
     # -- lifecycle -------------------------------------------------------
@@ -423,6 +429,9 @@ class SyncEngine:
         self._markers[tool] = marker
         self._last_scan[tool] = now
 
+        # New sessions since the last scan (e.g. a fork in Claude Desktop)
+        # must be seen in the tool's current metadata, not a cached copy.
+        adapter.refresh()
         sources = adapter.discover()
         expensive = marker is not None
         current: dict[str, Any] = {}
@@ -441,7 +450,8 @@ class SyncEngine:
             previous = self._seen.get(tool, {})
             for key, fp in current.items():
                 if previous.get(key) != fp:
-                    self._mark_pending(tool, adapter, by_key[key], now)
+                    self._mark_pending(tool, adapter, by_key[key], now,
+                                       reconvert=key not in previous)
         self._seen[tool] = current
         self._sources[tool] = by_key
 
@@ -456,18 +466,20 @@ class SyncEngine:
             return adapter.source_fingerprint(src)
         return (st.st_mtime_ns, st.st_size)
 
-    def _mark_pending(self, tool: str, adapter: SourceAdapter, src: Path, now: float) -> None:
+    def _mark_pending(self, tool: str, adapter: SourceAdapter, src: Path, now: float,
+                      *, reconvert: bool = False) -> None:
         key = (tool, str(src))
         pending = self._pending.get(key)
         if pending is not None:
             pending.last_change = now
+            pending.reconvert |= reconvert
             return
         title = ""
         try:
             title = adapter.session_info(src).title or ""
         except Exception:  # noqa: BLE001
             pass
-        self._pending[key] = Pending(tool, src, now, now, title)
+        self._pending[key] = Pending(tool, src, now, now, title, reconvert)
 
     def _take_due(self, now: float, force: bool) -> dict[str, list[Path]]:
         due: dict[str, dict[str, Path]] = {}
@@ -479,6 +491,8 @@ class SyncEngine:
         for key, pending in list(self._pending.items()):
             if force or now >= pending.due_at(self.config.quiet, self.config.max_delay):
                 due.setdefault(pending.tool, {})[str(pending.source)] = pending.source
+                if pending.reconvert:
+                    self._reconvert.add(str(pending.source))
                 del self._pending[key]
         return {tool: list(bucket.values()) for tool, bucket in due.items() if bucket}
 
@@ -486,11 +500,20 @@ class SyncEngine:
 
     def _export(self, tool: str, sources: list[Path]) -> list[_Written]:
         adapter = self.adapters[tool]
+        fresh = [s for s in sources if str(s) in self._reconvert]
+        known = [s for s in sources if str(s) not in self._reconvert]
         try:
-            result = export_all(
-                adapter, self.archive, sources=sources,
-                manifest_dir=self.state_dir, skip_identical=True,
-            )
+            result = ExportResult()
+            for group, force in ((known, False), (fresh, True)):
+                if not group:
+                    continue
+                part = export_all(
+                    adapter, self.archive, sources=group, force=force,
+                    manifest_dir=self.state_dir, skip_identical=True, keep_newer=True,
+                )
+                for name in ("new", "updated", "skipped", "failed", "kept_newer"):
+                    getattr(result, name).extend(getattr(part, name))
+            self._reconvert.difference_update(str(s) for s in fresh)
         except Exception as exc:  # noqa: BLE001 - e.g. archive gone mid-run
             self._problem(f"export:{tool}", f"Export of {tool} failed: {exc}", tool=tool)
             self._catchup.setdefault(tool, []).extend(sources)
@@ -508,8 +531,27 @@ class SyncEngine:
                 self._emit(Activity(
                     "error", f"Export failed: {src.name}", tool=tool, detail=message,
                 ))
+        kept = {str(src) for src, _ in result.kept_newer}
+        for src, reason in result.kept_newer:
+            key = f"kept:{src}"
+            if self._session_failures.get(key) != reason:
+                self._session_failures[key] = reason
+                name = adapter.ocf_filename_for(src)
+                title = ""
+                try:
+                    title = adapter.session_info(src).title or ""
+                except Exception:  # noqa: BLE001
+                    pass
+                self._emit(Activity(
+                    "warning", f"Kept the newer archive version: {title or name}",
+                    tool=tool, title=title, doc=name[: -len(OCF_SUFFIX)],
+                    detail=f"{reason}; this machine's copy of the session is older "
+                    "(another machine continued it)",
+                ))
         for src in [*result.new, *result.updated, *result.skipped]:
             self._session_failures.pop(str(src), None)
+            if str(src) not in kept:
+                self._session_failures.pop(f"kept:{src}", None)
         return out
 
     # -- render, index, report ------------------------------------------
@@ -753,7 +795,9 @@ class SyncEngine:
         self._next_update_check = now + UPDATE_CHECK_EVERY
         behind = system.git_commits_behind(self._repo)
         head = system.git_head(self._repo)
-        restart = bool(head and self.status.running_head and head != self.status.running_head)
+        # Compare the code itself, not the commit: committing the running
+        # code changes the hash but needs no restart.
+        restart = system.code_fingerprint() != self._code_at_start
         if behind and behind != self.status.behind:
             self._emit(Activity(
                 "warning", f"{behind} new ocf-py commit(s) on the remote",
@@ -761,8 +805,8 @@ class SyncEngine:
             ))
         if restart and not self.status.restart_needed:
             self._emit(Activity(
-                "warning", "ocf-py checkout changed, restart OCF Sync",
-                detail=f"running {self.status.running_head}, checkout is at {head}",
+                "warning", "ocf-py code changed on disk, restart OCF Sync",
+                detail=f"started at {self.status.running_head}, checkout is now at {head}",
             ))
         self.status.behind = behind
         self.status.restart_needed = restart

@@ -32,6 +32,10 @@ class ExportResult:
     skipped: list[Path] = field(default_factory=list)
     failed: list[tuple[Path, str]] = field(default_factory=list)
     out_dir: Path | None = None
+    kept_newer: list[tuple[Path, str]] = field(default_factory=list)
+    """``(source_path, reason)`` for sources not written because the
+    archive already holds a newer state of the same session (another
+    machine has a longer copy of it). Also counted in ``skipped``."""
 
     @property
     def total_processed(self) -> int:

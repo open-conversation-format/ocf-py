@@ -70,6 +70,9 @@ def add_parsers(sub: argparse._SubParsersAction, tool_choices: list[str]) -> Non
     p_app.add_argument("--show", action="store_true", help="Open the window at start.")
     p_app.add_argument("--autostart", choices=["on", "off"],
                        help="Start the app at login (Windows Startup folder) and exit.")
+    p_app.add_argument("--foreground", action="store_true",
+                       help="Keep the app attached to this terminal (Ctrl+C quits). "
+                            "Default on Windows: start it in the background and return.")
 
 
 def resolve_config(args: argparse.Namespace) -> SyncConfig:
@@ -152,7 +155,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_app(args: argparse.Namespace) -> int:
+    import os
+
     from ocf.sync import system
+
+    # pythonw.exe (autostart, detached start) has no console streams.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
 
     if args.autostart:
         try:
@@ -171,7 +182,40 @@ def cmd_app(args: argparse.Namespace) -> int:
         print(f"error: the app needs extra packages ({exc}); run: uv sync --extra app",
               file=sys.stderr)
         return 2
+    if _should_detach(args):
+        return _detach()
     return run_app(config, show=args.show)
+
+
+def _should_detach(args: argparse.Namespace) -> bool:
+    """Started from a console on Windows: hand over to pythonw.exe."""
+    if args.foreground or sys.platform != "win32":
+        return False
+    return Path(sys.executable).name.lower() == "python.exe"
+
+
+def _detach() -> int:
+    """Start the app without a console and return the prompt at once."""
+    import subprocess
+
+    from ocf.sync.system import InstanceLock, gui_python
+
+    lock = InstanceLock(state_root() / "sync.lock")
+    if not lock.acquire():
+        print("OCF Sync is already running on this machine (tray icon in the notification area).")
+        return 1
+    lock.release()
+    argv = [a for a in sys.argv[1:] if a != "--save"]
+    flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    subprocess.Popen(
+        [str(gui_python()), "-m", "ocf", *argv, "--foreground"],
+        creationflags=flags, close_fds=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    print("OCF Sync started in the background: tray icon in the notification area. "
+          "Quit it from the tray menu or with Quit in its window.")
+    return 0
 
 
 def _print_status(config: SyncConfig) -> int:
