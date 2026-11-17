@@ -73,6 +73,9 @@ class SyncConfig:
     quiet: float = 90.0
     max_delay: float = 600.0
     slow_scan: float = 120.0
+    codex_imports: bool = False
+    """Also archive threads Codex Desktop imported from other agents
+    (copies of Claude Code sessions); see CodexAdapter.include_imports."""
     machine: str = field(default_factory=machine_name)
 
     # -- derived -------------------------------------------------------

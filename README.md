@@ -135,6 +135,7 @@ How it behaves:
 - If the index is unreachable, written sessions wait in a backlog and are indexed on the next successful attempt (retried every minute). If the archive is unreachable (cloud drive not mounted), nothing is written until it is back.
 - Once an hour it fetches the ocf-py remote and reports new commits; after a `git pull` it asks for a restart. It never updates itself.
 - Large sessions are uploaded whole by most sync clients on every write; raise `--max-delay` and `--quiet-period` if that is too much traffic.
+- Codex Desktop can import sessions of other agents (`external-agent-import-sync-enabled` in `~/.codex/config.toml`): it copies Claude Code sessions into Codex rollouts, with the dialog only and every message stamped with the import time. These copies are skipped, because the originals are archived under their own tool; a copied thread that was continued in Codex is archived, with `conversation.meta.codex.imported` naming the original. `--codex-imports on` (stored with `--save`) archives the pure copies too; for manual runs it is `ocf export codex --include-imports`.
 
 The activity log and the app's log file are in the local state directory ("Log folder" in the app).
 

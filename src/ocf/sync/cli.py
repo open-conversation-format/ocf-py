@@ -33,6 +33,9 @@ def add_parsers(sub: argparse._SubParsersAction, tool_choices: list[str]) -> Non
                    help="Write a session after it was unchanged this long (default: 90).")
     g.add_argument("--max-delay", dest="max_delay", type=float,
                    help="Write a busy session at least this often (default: 600).")
+    g.add_argument("--codex-imports", dest="codex_imports", choices=["on", "off"],
+                   help="Also archive threads Codex Desktop imported from other agents "
+                        "(copies of Claude Code sessions). Default: off.")
     g.add_argument("--save", action="store_true",
                    help=f"Store the given settings in {settings_path()} for later runs.")
 
@@ -82,6 +85,8 @@ def resolve_config(args: argparse.Namespace) -> SyncConfig:
         value = getattr(args, name, None)
         if value is not None:
             setattr(config, name, value if value != "" else None)
+    if getattr(args, "codex_imports", None) is not None:
+        config.codex_imports = args.codex_imports == "on"
     if args.save:
         path = config.save()
         print(f"settings saved to {path}")
@@ -231,7 +236,8 @@ def _print_status(config: SyncConfig) -> int:
         print(f"index        {config.meili_url} {config.index_name} ({key})")
     else:
         print("index        -")
-    print(f"tools        {' '.join(config.tools)}")
+    print(f"tools        {' '.join(config.tools)}"
+          f"{'' if 'codex' not in config.tools else ', Codex imports ' + ('on' if config.codex_imports else 'off')}")
     print(f"timing       scan every {config.interval:g}s, write after {config.quiet:g}s quiet, "
           f"at most every {config.max_delay:g}s")
     print(f"autostart    {'on' if autostart_enabled() else 'off'}")

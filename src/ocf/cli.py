@@ -259,6 +259,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Re-export every session even if the manifest says skip.",
     )
     p_export.add_argument(
+        "--include-imports",
+        dest="include_imports",
+        action="store_true",
+        help=(
+            "codex only: also export threads Codex Desktop imported from other "
+            "agents (copies of Claude Code sessions, skipped by default)."
+        ),
+    )
+    p_export.add_argument(
         "--dry-run",
         dest="dry_run",
         action="store_true",
@@ -495,6 +504,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_index.add_argument(
+        "--remove",
+        nargs="+",
+        metavar="DOC",
+        default=None,
+        help=(
+            "Delete every chunk of these documents (archive file stems, the "
+            "index field 'doc') from the index and exit."
+        ),
+    )
+    p_index.add_argument(
         "--watch",
         action="store_true",
         help="Keep running and re-index changed sessions every --interval seconds.",
@@ -558,6 +577,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def _cmd_export(args: argparse.Namespace) -> int:
     module = _TOOLS[args.tool]
     source_dir = args.source_dir
+    if hasattr(module.adapter, "include_imports"):
+        module.adapter.include_imports = bool(getattr(args, "include_imports", False))
 
     if args.source is None:
         result = module.export_all(
@@ -593,6 +614,9 @@ def _cmd_export(args: argparse.Namespace) -> int:
         for src in result.skipped:
             print(f"skipped  {src}")
 
+    if not args.quiet:
+        for src in result.vanished:
+            print(f"vanished {src} (moved or compressed by the tool during the run)")
     for src, reason in result.kept_newer:
         print(f"kept     {src}: not overwritten, {reason} (--force overwrites)")
 
@@ -909,8 +933,13 @@ def _cmd_index(args: argparse.Namespace) -> int:
         print("error: --recovered requires --from-archive", file=sys.stderr)
         return 2
 
-    # Connect
+    # Connect. Key: --key, MEILI_MASTER_KEY, else the key OCF Sync keeps
+    # in the system credential store for this URL.
     api_key = args.key or os.environ.get("MEILI_MASTER_KEY") or ""
+    if not api_key:
+        from ocf.sync import secrets
+
+        api_key = secrets.get_key(args.url) or ""
     try:
         client = meilisearch.Client(args.url, api_key)
         client.health()
@@ -920,6 +949,22 @@ def _cmd_index(args: argparse.Namespace) -> int:
 
     index_name = args.index_name or DEFAULT_INDEX
     index = ensure_index(client, index_name)
+
+    if args.remove:
+        import json
+        from ocf.indexers.meilisearch import wait_for_tasks
+
+        docs = ", ".join(json.dumps(d) for d in args.remove)
+        # get_documents counts exactly; search hit estimates stop at 1000.
+        before = index.get_documents(
+            {"filter": f"doc IN [{docs}]", "limit": 1, "fields": ["id"]}).total
+        task = index.delete_documents(filter=f"doc IN [{docs}]")
+        failed = wait_for_tasks(client, [task.task_uid])
+        if failed:
+            print(f"error: delete failed: {failed[task.task_uid]}", file=sys.stderr)
+            return 1
+        print(f"removed {before} chunks of {len(args.remove)} document(s) from {index_name}")
+        return 0
 
     if args.from_archive is not None:
         print(f"indexing archive {args.from_archive} into {args.url}/indexes/{index_name}")

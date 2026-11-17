@@ -542,6 +542,15 @@ def export_all(
                 result.new.append(src)
             else:
                 result.updated.append(src)
+        except FileNotFoundError as exc:
+            # The tool moved or compressed the file between discovery and
+            # export (Codex compresses finished rollouts in place). The
+            # next discovery finds it under its new name.
+            if _is_source_file(exc, src):
+                result.vanished.append(src)
+                result.skipped.append(src)
+            else:
+                result.failed.append((src, f"{type(exc).__name__}: {exc}"))
         except Exception as exc:  # noqa: BLE001
             result.failed.append((src, f"{type(exc).__name__}: {exc}"))
 
@@ -549,6 +558,16 @@ def export_all(
         save_manifest(manifest_dir, manifest)
 
     return result
+
+
+def _is_source_file(exc: FileNotFoundError, src: Path) -> bool:
+    """The missing file is the source itself (or, for synthetic tokens
+    like ``<db>::<key>``, the file the token points into)."""
+    missing = getattr(exc, "filename", None)
+    if not missing:
+        return False
+    token = str(src)
+    return token == str(missing) or token.startswith(str(missing) + "::")
 
 
 def _message_extent(doc: dict[str, Any]) -> tuple[float, int]:

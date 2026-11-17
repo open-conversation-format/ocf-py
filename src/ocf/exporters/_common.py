@@ -32,6 +32,9 @@ class ExportResult:
     skipped: list[Path] = field(default_factory=list)
     failed: list[tuple[Path, str]] = field(default_factory=list)
     out_dir: Path | None = None
+    vanished: list[Path] = field(default_factory=list)
+    """Sources that disappeared between discovery and export (moved or
+    compressed by the tool). Also counted in ``skipped``."""
     kept_newer: list[tuple[Path, str]] = field(default_factory=list)
     """``(source_path, reason)`` for sources not written because the
     archive already holds a newer state of the same session (another

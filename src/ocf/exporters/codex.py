@@ -102,8 +102,20 @@ class CodexAdapter(SourceAdapter):
     mapping_id: ClassVar[str] = "codex-responses-jsonl-v1"
     rollout_glob: ClassVar[str] = "rollout-*.jsonl"
 
-    def __init__(self, *, session_index_path_override: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        session_index_path_override: Path | None = None,
+        include_imports: bool = False,
+    ) -> None:
         self._index_path_override = session_index_path_override
+        self.include_imports = include_imports
+        """Also export threads that Codex Desktop imported from another
+        agent (its "external agent import": Claude Code sessions copied
+        into Codex rollouts). Off by default: the copies hold only the
+        dialog, stamped with the import time, while the originals are
+        archived with full fidelity under their own tool. A thread that
+        was continued in Codex after the import is always exported."""
         # Per-path cache to avoid re-reading the same index inside one
         # export run. Entries are NEVER reused across source_dirs.
         self._index_cache: dict[str, dict[str, dict[str, Any]]] = {}
@@ -156,7 +168,17 @@ class CodexAdapter(SourceAdapter):
             source,
             session_index=self._resolve_index_for_source(Path(source)),
             validate=validate,
+            include_imports=self.include_imports,
+            import_registry=self._import_registry(),
         )
+
+    def _import_registry(self) -> dict[str, dict[str, Any]]:
+        """``imported_thread_id`` -> record from Codex Desktop's
+        ``external_agent_session_imports.json`` (cached until refresh())."""
+        key = "__external_imports__"
+        if key not in self._index_cache:
+            self._index_cache[key] = load_import_registry()
+        return self._index_cache[key]
 
     # ----- Session info (for ``ocf list``) ----------------------------------
 
@@ -387,14 +409,55 @@ def resolve_sources(
 # Conversion logic (format-specific, called from CodexAdapter.export_one)
 # ---------------------------------------------------------------------------
 
+IMPORT_TURN_PREFIX = "external-import-turn"
+"""Turn ids Codex Desktop gives the turns it copied from another agent."""
+
+IMPORT_REGISTRY_NAME = "external_agent_session_imports.json"
+
+
+def load_import_registry(path: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Codex Desktop's record of imported threads, keyed by thread id."""
+    path = path or codex_sessions_dir().parent / IMPORT_REGISTRY_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    records = data.get("records") if isinstance(data, dict) else None
+    out: dict[str, dict[str, Any]] = {}
+    for rec in records or []:
+        if isinstance(rec, dict) and isinstance(rec.get("imported_thread_id"), str):
+            out[rec["imported_thread_id"]] = rec
+    return out
+
+
+def import_turns(events: list[dict[str, Any]]) -> tuple[int, int]:
+    """(imported turns, native turns) by the events' ``turn_id``."""
+    imported: set[str] = set()
+    native: set[str] = set()
+    for ev in events:
+        p = ev.get("payload")
+        tid = p.get("turn_id") if isinstance(p, dict) else None
+        if isinstance(tid, str) and tid:
+            (imported if tid.startswith(IMPORT_TURN_PREFIX) else native).add(tid)
+    return len(imported), len(native)
+
+
 def _convert_codex_session(
     source: Path,
     *,
     session_index: dict[str, dict[str, Any]],
     validate: bool,
+    include_imports: bool = True,
+    import_registry: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Pure function: Codex rollout file -> OCF document dict."""
     events = list(iter_jsonl_tailsafe(source))
+    n_imported, n_native = import_turns(events)
+    if n_imported and not n_native and not include_imports:
+        raise SkipExport(
+            "Codex import of a session from another agent (only the dialog, "
+            "with import timestamps); the original is archived under its own tool"
+        )
 
     sm = next((e for e in events if e.get("type") == EVENT_SESSION_META), None)
     if sm is None:
@@ -518,6 +581,16 @@ def _convert_codex_session(
             }
         },
     }
+    if n_imported:
+        record = (import_registry or {}).get(session_id) or {}
+        origin = record.get("source_path")
+        if isinstance(origin, str):
+            origin = origin.removeprefix("\\\\?\\")  # Windows long-path prefix
+        conversation["meta"]["codex"]["imported"] = {
+            "imported_turns": n_imported,
+            "native_turns": n_native,
+            "from": origin,
+        }
     if ended_at is not None:
         conversation["updated_at"] = _format_iso(ended_at)
     if cwd:

@@ -58,7 +58,7 @@ PUSH_BATCH = 200
 # Adapters
 # ---------------------------------------------------------------------------
 
-def build_adapters(tools: list[str]) -> dict[str, SourceAdapter]:
+def build_adapters(tools: list[str], *, codex_imports: bool = False) -> dict[str, SourceAdapter]:
     """Adapter instances for the given CLI tool names."""
     from ocf.exporters.chatgpt import ChatGPTAdapter
     from ocf.exporters.claude_ai import ClaudeAiAdapter
@@ -82,7 +82,10 @@ def build_adapters(tools: list[str]) -> dict[str, SourceAdapter]:
     unknown = [t for t in tools if t not in registry]
     if unknown:
         raise ValueError(f"unknown tool(s): {', '.join(unknown)}")
-    return {t: registry[t]() for t in tools}
+    adapters = {t: registry[t]() for t in tools}
+    if "codex" in adapters:
+        adapters["codex"].include_imports = codex_imports  # type: ignore[attr-defined]
+    return adapters
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +231,8 @@ class SyncEngine:
         self.config = config
         self.archive = Path(config.archive)
         self.md_dir = Path(config.archive_md) if config.archive_md else None
-        self.adapters = adapters if adapters is not None else build_adapters(config.tools)
+        self.adapters = (adapters if adapters is not None
+                         else build_adapters(config.tools, codex_imports=config.codex_imports))
         if renderer is None and self.md_dir is not None:
             from ocf.renderers.markdown import MarkdownRenderer
 
@@ -511,7 +515,7 @@ class SyncEngine:
                     adapter, self.archive, sources=group, force=force,
                     manifest_dir=self.state_dir, skip_identical=True, keep_newer=True,
                 )
-                for name in ("new", "updated", "skipped", "failed", "kept_newer"):
+                for name in ("new", "updated", "skipped", "failed", "vanished", "kept_newer"):
                     getattr(result, name).extend(getattr(part, name))
             self._reconvert.difference_update(str(s) for s in fresh)
         except Exception as exc:  # noqa: BLE001 - e.g. archive gone mid-run

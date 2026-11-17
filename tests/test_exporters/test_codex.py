@@ -23,6 +23,7 @@ from ocf.exporters._base import SkipExport
 from ocf.exporters._manifest import load_manifest
 from ocf.exporters.codex import (
     AmbiguousMatchError,
+    CodexAdapter,
     discover,
     export_all,
     export_one,
@@ -519,7 +520,9 @@ def test_real_codex_session_exports_to_valid_ocf(
     Crucial because the synthetic fixture is a model of reality, not
     reality itself; this catches drift between assumption and truth.
     """
-    doc = export_one(real_codex_session)
+    # The newest rollout may be a Codex Desktop import (skipped by
+    # default); the conversion itself must work for those too.
+    doc = CodexAdapter(include_imports=True).export_one(real_codex_session)
     errors = validate(doc)
     if errors:
         details = "\n".join(f"  - {e.json_path}: {e.message}" for e in errors[:5])

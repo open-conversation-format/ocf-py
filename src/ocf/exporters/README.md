@@ -236,6 +236,15 @@ Storage changes seen with Codex Desktop's bundled 0.163 (2026-10; the
   own OCF document; `history_base` is kept in `meta.codex` so pages can
   be linked. Merging pages into one conversation is open.
 - Archived threads move to `~/.codex/archived_sessions/` (also scanned).
+- **External agent imports** (seen 2026-11, Codex Desktop 0.166,
+  setting `[desktop] external-agent-import-sync-enabled`): on start,
+  Codex copies Claude Code sessions into new rollouts. Their turns are
+  named `external-import-turn-<n>`, all timestamps are the import time,
+  and only the dialog is kept. `~/.codex/external_agent_session_imports.json`
+  maps `imported_thread_id` to the original `source_path`. The adapter
+  skips pure imports (`include_imports=False`, the default) and tags
+  continued ones with `meta.codex.imported` (`imported_turns`,
+  `native_turns`, `from`).
 - Paginated mode no longer writes the old `event_msg` content types
   (`user_message`, `agent_message`, ...) or `thread_name_updated`;
   `response_item` lines still carry the conversation. Not converted
